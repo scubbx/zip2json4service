@@ -73,10 +73,11 @@ jobs:
         run: |
           set -eux
 
-          mkdir -p build dist
+          mkdir -p build dist package
 
           binary="umap-geojson-proxy${{ matrix.ext }}"
           artifact_base="umap-geojson-proxy_${VERSION}_${GOOS}_${GOARCH}"
+          package_dir="package/${artifact_base}"
 
           go build \
             -trimpath \
@@ -84,12 +85,30 @@ jobs:
             -o "build/${binary}" \
             .
 
+          mkdir -p "${package_dir}"
+          cp "build/${binary}" "${package_dir}/${binary}"
+
+          if [ -f README.md ]; then
+            cp README.md "${package_dir}/README.md"
+          fi
+
+          if [ -f LICENSE ]; then
+            cp LICENSE "${package_dir}/LICENSE"
+          fi
+
           if [ "${{ matrix.archive }}" = "zip" ]; then
-            cd build
-            zip "../dist/${artifact_base}.zip" "${binary}"
+            cd package
+            zip -r "../dist/${artifact_base}.zip" "${artifact_base}"
             cd ..
           else
-            tar -C build -czf "dist/${artifact_base}.tar.gz" "${binary}"
+            tar -C package -czf "dist/${artifact_base}.tar.gz" "${artifact_base}"
+          fi
+
+          echo "Archive contents:"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            unzip -l "dist/${artifact_base}.zip"
+          else
+            tar -tzf "dist/${artifact_base}.tar.gz"
           fi
 
       - name: Upload build artifact
@@ -122,6 +141,9 @@ jobs:
           find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" \) -print0 | while IFS= read -r -d '' file; do
             cp "$file" dist/
           done
+
+          echo "Release assets:"
+          find dist -type f -maxdepth 1 -print | sort
 
           cd dist
           sha256sum * > SHA256SUMS.txt
