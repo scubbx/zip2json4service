@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,17 @@ import (
 	"time"
 )
 
+var version = "dev"
+
+type config struct {
+	sourceURL  string
+	listenAddr string
+	cacheTTL   time.Duration
+	staleTTL   time.Duration
+	maxBytes   int64
+	showVersion bool
+}
+
 type cacheEntry struct {
 	body       []byte
 	etag       string
@@ -27,15 +39,8 @@ type cacheEntry struct {
 	staleUntil time.Time
 }
 
-var version = "dev"
-
 var (
-	sourceURL = mustEnv("SOURCE_URL")
-
-	listenAddr = envString("LISTEN_ADDR", ":8080")
-	cacheTTL   = envDuration("CACHE_TTL", 5*time.Minute)
-	staleTTL   = envDuration("STALE_TTL", 24*time.Hour)
-	maxBytes   = envInt64("MAX_BYTES", 100*1024*1024) // 100 MB
+	cfg config
 
 	client = &http.Client{
 		Timeout: 30 * time.Second,
@@ -54,14 +59,129 @@ var (
 )
 
 func main() {
+	cfg = parseConfig()
+
+	if cfg.showVersion {
+		fmt.Println(version)
+		return
+	}
+
 	http.HandleFunc("/data.geojson", handleGeoJSON)
 	http.HandleFunc("/healthz", handleHealthz)
 
-	log.Printf("listening on %s", listenAddr)
-	log.Printf("source URL: %s", sourceURL)
-	log.Printf("cache TTL: %s, stale TTL: %s, max bytes: %d", cacheTTL, staleTTL, maxBytes)
+	log.Printf("listening on %s", cfg.listenAddr)
+	log.Printf("source URL: %s", cfg.sourceURL)
+	log.Printf("cache TTL: %s, stale TTL: %s, max bytes: %d", cfg.cacheTTL, cfg.staleTTL, cfg.maxBytes)
 
-	log.Fatal(http.ListenAndServe(listenAddr, nil))
+	log.Fatal(http.ListenAndServe(cfg.listenAddr, nil))
+}
+
+func parseConfig() config {
+	c := config{
+		sourceURL:  envString("SOURCE_URL", ""),
+		listenAddr: envString("LISTEN_ADDR", ":8080"),
+		cacheTTL:   envDuration("CACHE_TTL", 5*time.Minute),
+		staleTTL:   envDuration("STALE_TTL", 24*time.Hour),
+		maxBytes:   envInt64("MAX_BYTES", 100*1024*1024),
+	}
+
+	flag.StringVar(&c.sourceURL, "source-url", c.sourceURL, "Remote source URL to fetch. Can also be set via SOURCE_URL.")
+	flag.StringVar(&c.listenAddr, "listen-addr", c.listenAddr, "Address and port to listen on. Can also be set via LISTEN_ADDR.")
+	flag.DurationVar(&c.cacheTTL, "cache-ttl", c.cacheTTL, "Fresh cache lifetime, for example 30s, 5m, 1h. Can also be set via CACHE_TTL.")
+	flag.DurationVar(&c.staleTTL, "stale-ttl", c.staleTTL, "How long stale cached data may be served if refresh fails. Can also be set via STALE_TTL.")
+	flag.Int64Var(&c.maxBytes, "max-bytes", c.maxBytes, "Maximum allowed source response size in bytes. Can also be set via MAX_BYTES.")
+	flag.BoolVar(&c.showVersion, "version", false, "Print version and exit.")
+
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+
+		fmt.Fprintf(out, `uMap GeoJSON gzip Proxy
+
+Fetches a remote GeoJSON source, decompresses gzip payloads if needed,
+validates the result as JSON, caches it in memory, and serves it as plain
+GeoJSON for uMap or similar clients.
+
+Usage:
+
+  %[1]s --source-url URL [options]
+
+Examples:
+
+  %[1]s --source-url "https://example.com/export"
+
+  %[1]s \
+    --source-url "https://example.com/api/data?id=123" \
+    --listen-addr ":8080" \
+    --cache-ttl 5m \
+    --stale-ttl 24h
+
+Environment based usage:
+
+  SOURCE_URL="https://example.com/export" %[1]s
+
+uMap configuration:
+
+  URL:    https://your-domain.example/data.geojson
+  Format: GeoJSON
+
+Options:
+
+`, os.Args[0])
+
+		flag.PrintDefaults()
+
+		fmt.Fprintf(out, `
+
+Environment variables:
+
+  SOURCE_URL   Remote source URL. Required unless --source-url is set.
+  LISTEN_ADDR  Address and port to listen on. Default: :8080
+  CACHE_TTL    Fresh cache lifetime. Default: 5m
+  STALE_TTL    Stale cache lifetime after refresh errors. Default: 24h
+  MAX_BYTES    Maximum allowed source response size in bytes. Default: 104857600
+
+Endpoints:
+
+  GET  /data.geojson   Returns the proxied GeoJSON
+  HEAD /data.geojson   Returns headers only
+  GET  /healthz        Health check endpoint
+
+Notes:
+
+  The source URL does not need a .geojson or .gz file extension.
+  Gzip is detected by inspecting the response body for gzip magic bytes.
+  CLI flags override environment variables.
+`)
+	}
+
+	flag.Parse()
+
+	c.sourceURL = strings.TrimSpace(c.sourceURL)
+	c.listenAddr = strings.TrimSpace(c.listenAddr)
+
+	if c.sourceURL == "" && !c.showVersion {
+		fmt.Fprintln(os.Stderr, "error: missing required source URL")
+		fmt.Fprintln(os.Stderr)
+		flag.Usage()
+		os.Exit(2)
+	}
+
+	if c.cacheTTL <= 0 {
+		fmt.Fprintln(os.Stderr, "error: --cache-ttl must be greater than 0")
+		os.Exit(2)
+	}
+
+	if c.staleTTL < 0 {
+		fmt.Fprintln(os.Stderr, "error: --stale-ttl must not be negative")
+		os.Exit(2)
+	}
+
+	if c.maxBytes <= 0 {
+		fmt.Fprintln(os.Stderr, "error: --max-bytes must be greater than 0")
+		os.Exit(2)
+	}
+
+	return c
 }
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
@@ -88,11 +208,9 @@ func handleGeoJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verhindert, dass viele gleichzeitige Requests alle parallel die Quelle laden.
 	refreshMu.Lock()
 	defer refreshMu.Unlock()
 
-	// Während wir auf refreshMu gewartet haben, könnte jemand anderer den Cache erneuert haben.
 	if entry, ok := getFreshCache(time.Now()); ok {
 		serveCache(w, r, entry, "HIT")
 		return
@@ -112,12 +230,13 @@ func handleGeoJSON(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	now = time.Now()
 	entry := &cacheEntry{
 		body:       body,
 		etag:       makeETag(body),
-		fetchedAt:  time.Now(),
-		expiresAt:  time.Now().Add(cacheTTL),
-		staleUntil: time.Now().Add(cacheTTL + staleTTL),
+		fetchedAt:  now,
+		expiresAt:  now.Add(cfg.cacheTTL),
+		staleUntil: now.Add(cfg.cacheTTL + cfg.staleTTL),
 	}
 
 	cacheMu.Lock()
@@ -128,12 +247,12 @@ func handleGeoJSON(w http.ResponseWriter, r *http.Request) {
 }
 
 func fetchAndPrepare(ctx context.Context) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, cfg.sourceURL, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	req.Header.Set("User-Agent", "umap-geojson-gzip-proxy/1.0")
+	req.Header.Set("User-Agent", "umap-geojson-gzip-proxy/"+version)
 	req.Header.Set("Accept", "application/geo+json, application/json, */*")
 
 	resp, err := client.Do(req)
@@ -147,16 +266,13 @@ func fetchAndPrepare(ctx context.Context) ([]byte, error) {
 		return nil, fmt.Errorf("source returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))
 	}
 
-	body, err := readLimited(resp.Body, maxBytes)
+	body, err := readLimited(resp.Body, cfg.maxBytes)
 	if err != nil {
 		return nil, err
 	}
 
-	// Fall 1: Server liefert echte gzip-Datei als Inhalt, z. B. application/gzip.
-	// Fall 2: Server liefert HTTP Content-Encoding gzip.
-	//         Dann entpackt Go normalerweise bereits automatisch; dann greift das hier nicht.
 	if isGzip(body) {
-		body, err = gunzipLimited(body, maxBytes)
+		body, err = gunzipLimited(body, cfg.maxBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -229,7 +345,7 @@ func serveCache(w http.ResponseWriter, r *http.Request, entry *cacheEntry, cache
 	setCORSHeaders(w)
 
 	w.Header().Set("Content-Type", "application/geo+json; charset=utf-8")
-	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(cacheTTL.Seconds())))
+	w.Header().Set("Cache-Control", fmt.Sprintf("public, max-age=%d", int(cfg.cacheTTL.Seconds())))
 	w.Header().Set("ETag", entry.etag)
 	w.Header().Set("X-Cache", cacheStatus)
 	w.Header().Set("X-Cache-Fetched-At", entry.fetchedAt.UTC().Format(time.RFC3339))
@@ -257,14 +373,6 @@ func setCORSHeaders(w http.ResponseWriter) {
 func makeETag(body []byte) string {
 	sum := sha256.Sum256(body)
 	return `"` + hex.EncodeToString(sum[:]) + `"`
-}
-
-func mustEnv(key string) string {
-	value := strings.TrimSpace(os.Getenv(key))
-	if value == "" {
-		log.Fatalf("missing required environment variable %s", key)
-	}
-	return value
 }
 
 func envString(key string, fallback string) string {
