@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version/tag, e.g. v0.1.0"
+        required: true
+        type: string
+      draft:
+        description: "Create as draft release"
+        required: true
+        default: false
+        type: boolean
+      prerelease:
+        description: "Mark as prerelease"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            ext: ""
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+            archive: tar.gz
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+            archive: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eux
+
+          mkdir -p dist build
+
+          binary="umap-geojson-proxy${{ matrix.ext }}"
+          artifact_base="umap-geojson-proxy_${VERSION}_${GOOS}_${GOARCH}"
+
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.version=${VERSION}" \
+            -o "build/${binary}" \
+            .
+
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cd build
+            zip "../dist/${artifact_base}.zip" "${binary}"
+            cd ..
+          else
+            tar -C build -czf "dist/${artifact_base}.tar.gz" "${binary}"
+          fi
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: umap-geojson-proxy-${{ inputs.version }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub release
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          set -eux
+
+          mkdir -p dist
+          find artifacts -type f -name "*.tar.gz" -o -name "*.zip" | while read -r file; do
+            cp "$file" dist/
+          done
+
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -eux
+
+          args=(
+            "$VERSION"
+            dist/*
+            --repo "$GITHUB_REPOSITORY"
+            --target "$GITHUB_SHA"
+            --title "$VERSION"
+            --generate-notes
+          )
+
+          if [ "$DRAFT" = "true" ]; then
+            args+=(--draft)
+          fi
+
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+
+          gh release create "${args[@]}"
