@@ -7,7 +7,8 @@ declare(strict_types=1);
  *
  * Downloads a gzip-compressed GeoJSON source and a GeoJSON buffer dataset,
  * keeps only source features that intersect at least one buffer polygon,
- * caches the filtered result, and serves plain GeoJSON to uMap.
+ * caches full and point representations of the filtered result, and serves
+ * plain GeoJSON to uMap.
  *
  * No database or external GIS library is required.
  */
@@ -21,7 +22,7 @@ declare(strict_types=1);
 |
 */
 
-const VERSION = '1.1.0';
+const VERSION = '1.4.0';
 
 /**
  * Main source dataset containing all features.
@@ -34,6 +35,28 @@ const SOURCE_URL = 'https://example.org/source.geojson.gz';
  * The response may be gzip-compressed or plain GeoJSON.
  */
 const BUFFER_URL = 'https://example.org/buffer.geojson.gz';
+
+/**
+ * Feature property containing the transport-mode list.
+ */
+const TRANSPORT_MODE_PROPERTY = 'affected-transportmode-types';
+
+/**
+ * Allowed transport-mode values.
+ *
+ * A feature passes this attribute filter when at least one value from its
+ * properties[TRANSPORT_MODE_PROPERTY] list occurs in this array.
+ *
+ * Leave the array empty to disable the attribute filter and retain all
+ * transport modes that pass the spatial filter.
+ *
+ * Matching is exact and case-sensitive.
+ *
+ * Example:
+ *
+ * const ALLOWED_TRANSPORT_MODE_TYPES = ['bus', 'tram', 'train'];
+ */
+const ALLOWED_TRANSPORT_MODE_TYPES = [];
 
 /** Writable cache directory. */
 const CACHE_DIR = __DIR__ . '/cache';
@@ -60,6 +83,34 @@ const USER_AGENT = 'umap-geojson-spatial-filter/' . VERSION;
 /** Numerical tolerance used by the pure-PHP geometry tests. */
 const GEO_EPSILON = 1.0e-12;
 
+/** Write detailed processing information into CACHE_DIR/proxy.log. */
+const DEBUG_LOG_ENABLED = true;
+
+/** Log file name inside CACHE_DIR. */
+const DEBUG_LOG_FILENAME = 'proxy.log';
+
+/** Current processing status file name inside CACHE_DIR. */
+const STATUS_FILENAME = 'status.json';
+
+/** Allow GET requests with ?status=1 to return the current processing status. */
+const STATUS_ENDPOINT_ENABLED = true;
+
+/** Write filtering progress after this many source features. Set to 0 to disable. */
+const LOG_PROGRESS_EVERY = 1000;
+
+/** Approximate number of indexed buffer segments per grid cell. */
+const SPATIAL_INDEX_TARGET_SEGMENTS_PER_CELL = 12;
+
+/** Upper bounds prevent pathological memory use on unusual geometries. */
+const SPATIAL_INDEX_MAX_TOTAL_CELLS = 65536;
+const SPATIAL_INDEX_MAX_GRID_DIMENSION = 256;
+const SPATIAL_INDEX_MAX_CELLS_PER_SEGMENT = 1024;
+
+/** Point-in-polygon Y-bucket index settings. */
+const POINT_INDEX_TARGET_EDGES_PER_BUCKET = 24;
+const POINT_INDEX_MAX_BUCKETS = 512;
+const POINT_INDEX_MAX_BUCKETS_PER_EDGE = 128;
+
 try {
     $config = loadConfig();
 
@@ -83,12 +134,21 @@ function loadConfig(): array
     return [
         'source_url' => SOURCE_URL,
         'buffer_url' => BUFFER_URL,
+        'transport_mode_property' => TRANSPORT_MODE_PROPERTY,
+        'allowed_transport_mode_types' => normalizeAllowedTransportModeTypes(
+            ALLOWED_TRANSPORT_MODE_TYPES
+        ),
         'cache_dir' => CACHE_DIR,
         'cache_ttl' => parseDuration(CACHE_TTL),
         'stale_ttl' => parseDuration(STALE_TTL),
         'max_bytes' => MAX_BYTES,
         'http_timeout' => HTTP_TIMEOUT,
         'user_agent' => USER_AGENT,
+        'debug_log_enabled' => DEBUG_LOG_ENABLED,
+        'log_file' => CACHE_DIR . '/' . DEBUG_LOG_FILENAME,
+        'status_file' => CACHE_DIR . '/' . STATUS_FILENAME,
+        'status_endpoint_enabled' => STATUS_ENDPOINT_ENABLED,
+        'log_progress_every' => LOG_PROGRESS_EVERY,
     ];
 }
 
@@ -112,47 +172,115 @@ function webMain(array $config): void
     validateConfig($config);
     ensureCacheDir($config['cache_dir']);
 
+    if (
+        $method === 'GET'
+        && $config['status_endpoint_enabled']
+        && isset($_GET['status'])
+    ) {
+        serveStatus($config);
+        return;
+    }
+
+    $geometryMode = requestedGeometryMode();
+
+    initializeDiagnostics($config, 'web');
+    setProxyStage('request-start', [
+        'method' => $method,
+        'request_uri' => $_SERVER['REQUEST_URI'] ?? null,
+        'geometry_mode' => $geometryMode,
+    ]);
+
     $entry = loadCache($config);
 
     if ($entry !== null && time() < $entry['expires_at']) {
-        serveCache($entry, 'HIT', $method);
+        setProxyStage('serving-fresh-cache', [
+            'cache_age_seconds' => max(0, time() - $entry['fetched_at']),
+            'response_bytes' => strlen(
+                $geometryMode === 'point' ? $entry['point_body'] : $entry['body']
+            ),
+            'geometry_mode' => $geometryMode,
+        ]);
+        serveCache($entry, 'HIT', $method, $geometryMode);
         return;
     }
+
+    proxyLog('INFO', 'no fresh cache available', [
+        'cache_present' => $entry !== null,
+    ]);
 
     $lockPath = $config['cache_dir'] . '/refresh.lock';
     $lock = fopen($lockPath, 'c');
 
     if ($lock === false) {
+        setProxyStage('lock-open-failed', ['lock_path' => $lockPath]);
         sendError(500, 'could not open cache lock file');
         return;
     }
+
+    $lockWaitStarted = microtime(true);
+    setProxyStage('waiting-for-refresh-lock', ['lock_path' => $lockPath]);
 
     try {
         if (!flock($lock, LOCK_EX)) {
             throw new RuntimeException('could not acquire cache lock');
         }
 
+        setProxyStage('refresh-lock-acquired', [
+            'wait_seconds' => round(microtime(true) - $lockWaitStarted, 3),
+        ]);
+
         // Another request may have refreshed the cache while this request waited.
         $entry = loadCache($config);
 
         if ($entry !== null && time() < $entry['expires_at']) {
-            serveCache($entry, 'HIT', $method);
+            setProxyStage('serving-cache-refreshed-by-other-request', [
+                'cache_age_seconds' => max(0, time() - $entry['fetched_at']),
+                'response_bytes' => strlen(
+                    $geometryMode === 'point' ? $entry['point_body'] : $entry['body']
+                ),
+                'geometry_mode' => $geometryMode,
+            ]);
+            serveCache($entry, 'HIT', $method, $geometryMode);
             return;
         }
 
         try {
-            $body = fetchAndPrepare($config);
-            $entry = saveCache($config, $body);
-            serveCache($entry, 'MISS', $method);
+            setProxyStage('refresh-started');
+            $representations = fetchAndPrepare($config);
+
+            setProxyStage('writing-cache', [
+                'result_bytes' => strlen($representations['full']),
+                'point_result_bytes' => strlen($representations['point']),
+            ]);
+            $entry = saveCache(
+                $config,
+                $representations['full'],
+                $representations['point']
+            );
+
+            setProxyStage('refresh-complete', [
+                'response_bytes' => strlen($entry['body']),
+                'point_response_bytes' => strlen($entry['point_body']),
+                'etag' => $entry['etag'],
+                'point_etag' => $entry['point_etag'],
+            ]);
+            serveCache($entry, 'MISS', $method, $geometryMode);
             return;
         } catch (Throwable $e) {
-            error_log('GeoJSON proxy refresh failed: ' . $e->getMessage());
+            logProxyException('GeoJSON proxy refresh failed', $e);
+            setProxyStage('refresh-failed', [
+                'exception' => get_class($e),
+                'message' => $e->getMessage(),
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+            ]);
 
             $entry = loadCache($config);
 
             if ($entry !== null && time() < $entry['stale_until']) {
                 header('Warning: 110 - "Response is stale because source refresh failed"');
-                serveCache($entry, 'STALE', $method);
+                proxyLog('WARNING', 'serving stale cache after refresh failure');
+                serveCache($entry, 'STALE', $method, $geometryMode);
                 return;
             }
 
@@ -164,9 +292,48 @@ function webMain(array $config): void
             return;
         }
     } finally {
+        proxyLog('INFO', 'releasing refresh lock');
         flock($lock, LOCK_UN);
         fclose($lock);
     }
+}
+
+/**
+ * Selects the representation served for this request.
+ *
+ * The default keeps the complete filtered geometries. ?geometry=point returns
+ * a Point geometry for every retained feature while preserving IDs,
+ * properties, and other feature members.
+ */
+function requestedGeometryMode(): string
+{
+    if (!array_key_exists('geometry', $_GET)) {
+        return 'full';
+    }
+
+    $value = $_GET['geometry'];
+
+    if (!is_string($value)) {
+        sendError(400, 'invalid geometry parameter', 'geometry must be a string');
+        exit;
+    }
+
+    $value = strtolower(trim($value));
+
+    if ($value === '' || $value === 'full') {
+        return 'full';
+    }
+
+    if ($value === 'point' || $value === 'centroid') {
+        return 'point';
+    }
+
+    sendError(
+        400,
+        'invalid geometry parameter',
+        'supported values are full, point, and centroid'
+    );
+    exit;
 }
 
 function cliMain(array $argv, array $config): void
@@ -186,6 +353,8 @@ function cliMain(array $argv, array $config): void
     if (in_array('--warm-cache', $args, true)) {
         validateConfig($config);
         ensureCacheDir($config['cache_dir']);
+        initializeDiagnostics($config, 'cli');
+        setProxyStage('cli-warm-cache-start');
 
         $lockPath = $config['cache_dir'] . '/refresh.lock';
         $lock = fopen($lockPath, 'c');
@@ -199,8 +368,23 @@ function cliMain(array $argv, array $config): void
                 throw new RuntimeException('could not acquire cache lock');
             }
 
-            $body = fetchAndPrepare($config);
-            $entry = saveCache($config, $body);
+            setProxyStage('cli-refresh-lock-acquired');
+            $representations = fetchAndPrepare($config);
+            setProxyStage('writing-cache', [
+                'result_bytes' => strlen($representations['full']),
+                'point_result_bytes' => strlen($representations['point']),
+            ]);
+            $entry = saveCache(
+                $config,
+                $representations['full'],
+                $representations['point']
+            );
+            setProxyStage('cli-warm-cache-complete', [
+                'result_bytes' => strlen($entry['body']),
+                'point_result_bytes' => strlen($entry['point_body']),
+                'etag' => $entry['etag'],
+                'point_etag' => $entry['point_etag'],
+            ]);
         } finally {
             flock($lock, LOCK_UN);
             fclose($lock);
@@ -209,6 +393,8 @@ function cliMain(array $argv, array $config): void
         echo "cache refreshed\n";
         echo 'etag: ' . $entry['etag'] . "\n";
         echo 'bytes: ' . strlen($entry['body']) . "\n";
+        echo 'point_etag: ' . $entry['point_etag'] . "\n";
+        echo 'point_bytes: ' . strlen($entry['point_body']) . "\n";
         echo 'expires_at: ' . gmdate(DATE_ATOM, $entry['expires_at']) . "\n";
         echo 'stale_until: ' . gmdate(DATE_ATOM, $entry['stale_until']) . "\n";
         echo 'peak_memory_mib: ' . number_format(
@@ -238,19 +424,45 @@ Configuration:
 
   SOURCE_URL     Source FeatureCollection containing all objects.
   BUFFER_URL     GeoJSON containing Polygon or MultiPolygon buffers.
+  TRANSPORT_MODE_PROPERTY
+                 Feature property containing the transport-mode list.
+  ALLOWED_TRANSPORT_MODE_TYPES
+                 Exact, case-sensitive values allowed by the attribute filter.
+                 At least one configured value must occur in a feature. An
+                 empty array disables this additional attribute filter.
   CACHE_DIR      Writable cache directory.
   CACHE_TTL      Fresh result-cache lifetime.
   STALE_TTL      Stale-cache lifetime after refresh errors.
   MAX_BYTES      Maximum compressed, decompressed, or result size.
   HTTP_TIMEOUT   Upstream HTTP timeout in seconds.
+  DEBUG_LOG_ENABLED
+                 Write detailed JSON-lines logs to CACHE_DIR/proxy.log.
+  LOG_PROGRESS_EVERY
+                 Write filtering progress after this many source features.
 
 Web usage:
 
+  Full filtered geometries:
   https://your-domain.example/geojson-spatial-filter-proxy.php
+
+  Point representation (centroid or robust fallback per feature):
+  https://your-domain.example/geojson-spatial-filter-proxy.php?geometry=point
+
+Status endpoint:
+
+  https://your-domain.example/geojson-spatial-filter-proxy.php?status=1
+
+  The normal endpoint remains GeoJSON-only. The status endpoint reports the
+  current processing stage without interrupting the running refresh.
 
 uMap configuration:
 
+  Full geometry layer:
   URL:    https://your-domain.example/geojson-spatial-filter-proxy.php
+  Format: GeoJSON
+
+  Symbol/point layer:
+  URL:    https://your-domain.example/geojson-spatial-filter-proxy.php?geometry=point
   Format: GeoJSON
 
 CLI usage:
@@ -272,9 +484,13 @@ Notes:
   Both remote responses may be gzip-compressed or plain GeoJSON.
   Gzip is detected from the response body's gzip magic bytes.
   The source GeoJSON must be a FeatureCollection.
+  When ALLOWED_TRANSPORT_MODE_TYPES is not empty, a feature must have a
+  matching string in properties[TRANSPORT_MODE_PROPERTY].
   Buffer data may be a Geometry, Feature, FeatureCollection, or
   GeometryCollection containing Polygon or MultiPolygon geometries.
   Both datasets must use the same coordinate reference system.
+  The point representation is calculated in that coordinate plane. For normal
+  longitude/latitude GeoJSON this is a planar, not geodesic, centroid.
   This is a fixed-purpose proxy, not an open proxy.
 
 TEXT;
@@ -303,6 +519,14 @@ function validateConfig(array $config): void
         }
     }
 
+    if (trim((string) $config['transport_mode_property']) === '') {
+        throw new RuntimeException('TRANSPORT_MODE_PROPERTY must not be empty');
+    }
+
+    if (!is_array($config['allowed_transport_mode_types'])) {
+        throw new RuntimeException('ALLOWED_TRANSPORT_MODE_TYPES must be an array');
+    }
+
     if ($config['cache_ttl'] <= 0) {
         throw new RuntimeException('CACHE_TTL must be greater than zero');
     }
@@ -321,33 +545,59 @@ function validateConfig(array $config): void
 }
 
 /**
- * Downloads both GeoJSON documents, filters the source, and returns the final
- * uncompressed GeoJSON string that will be stored in the cache.
+ * Downloads both GeoJSON documents, filters the source, and returns the full
+ * and point GeoJSON representations that will be stored in the cache.
  */
-function fetchAndPrepare(array $config): string
+function fetchAndPrepare(array $config): array
 {
     $startedAt = microtime(true);
 
+    setProxyStage('downloading-source');
     $sourceDocument = fetchGeoJsonDocument(
         $config,
         $config['source_url'],
         'source GeoJSON'
     );
 
+    setProxyStage('source-decoded', [
+        'geojson_type' => $sourceDocument['type'] ?? null,
+        'feature_count' => is_array($sourceDocument['features'] ?? null)
+            ? count($sourceDocument['features'])
+            : null,
+    ]);
+
+    setProxyStage('downloading-buffer');
     $bufferDocument = fetchGeoJsonDocument(
         $config,
         $config['buffer_url'],
         'buffer GeoJSON'
     );
 
+    setProxyStage('buffer-decoded', [
+        'geojson_type' => $bufferDocument['type'] ?? null,
+    ]);
+
+    setProxyStage('spatial-filter-start');
     [$filteredDocument, $statistics] = filterGeoJsonByBuffers(
         $sourceDocument,
-        $bufferDocument
+        $bufferDocument,
+        $config['transport_mode_property'],
+        $config['allowed_transport_mode_types']
     );
+
+    setProxyStage('spatial-filter-complete', $statistics);
+    setProxyStage('building-point-representation', $statistics);
+    [$pointDocument, $pointStatistics] = createPointRepresentation($filteredDocument);
+
+    setProxyStage('encoding-result', array_merge($statistics, $pointStatistics));
 
     try {
         $body = json_encode(
             $filteredDocument,
+            JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+        );
+        $pointBody = json_encode(
+            $pointDocument,
             JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
         );
     } catch (JsonException $e) {
@@ -362,18 +612,31 @@ function fetchAndPrepare(array $config): string
         throw new RuntimeException('filtered result exceeds MAX_BYTES');
     }
 
-    error_log(sprintf(
-        'GeoJSON filter refreshed: retained %d of %d features; '
-        . '%d buffer polygons; result %.2f MiB; peak memory %.2f MiB; %.2f s',
-        $statistics['retained_features'],
-        $statistics['source_features'],
-        $statistics['buffer_polygons'],
-        strlen($body) / 1024 / 1024,
-        memory_get_peak_usage(true) / 1024 / 1024,
-        microtime(true) - $startedAt
-    ));
+    if (strlen($pointBody) > $config['max_bytes']) {
+        throw new RuntimeException('point result exceeds MAX_BYTES');
+    }
 
-    return $body;
+    $summary = [
+        'retained_features' => $statistics['retained_features'],
+        'point_features' => $pointStatistics['point_features'],
+        'point_features_omitted' => $pointStatistics['point_features_omitted'],
+        'source_features' => $statistics['source_features'],
+        'transport_mode_filter_enabled' => $statistics['transport_mode_filter_enabled'],
+        'transport_mode_matched_features' => $statistics['transport_mode_matched_features'],
+        'transport_mode_rejected_features' => $statistics['transport_mode_rejected_features'],
+        'buffer_polygons' => $statistics['buffer_polygons'],
+        'result_bytes' => strlen($body),
+        'point_result_bytes' => strlen($pointBody),
+        'duration_seconds' => round(microtime(true) - $startedAt, 3),
+    ];
+
+    proxyLog('INFO', 'GeoJSON filter representations prepared successfully', $summary);
+    setProxyStage('ready-to-cache', $summary);
+
+    return [
+        'full' => $body,
+        'point' => $pointBody,
+    ];
 }
 
 /**
@@ -381,13 +644,30 @@ function fetchAndPrepare(array $config): string
  */
 function fetchGeoJsonDocument(array $config, string $url, string $label): array
 {
+    proxyLog('INFO', 'starting GeoJSON download', [
+        'label' => $label,
+        'url' => $url,
+    ]);
+
     $downloaded = fetchUrl($config, $url);
+    $downloadedBytes = strlen($downloaded);
+    $gzip = isGzip($downloaded);
+
+    proxyLog('INFO', 'GeoJSON download completed', [
+        'label' => $label,
+        'downloaded_bytes' => $downloadedBytes,
+        'gzip_payload' => $gzip,
+    ]);
 
     if (strlen($downloaded) > $config['max_bytes']) {
         throw new RuntimeException($label . ' response exceeds MAX_BYTES');
     }
 
-    if (isGzip($downloaded)) {
+    if ($gzip) {
+        proxyLog('INFO', 'decompressing gzip payload', [
+            'label' => $label,
+            'compressed_bytes' => $downloadedBytes,
+        ]);
         if (!function_exists('gzdecode')) {
             throw new RuntimeException('PHP zlib support is required for gzip data');
         }
@@ -397,6 +677,12 @@ function fetchGeoJsonDocument(array $config, string $url, string $label): array
         if ($body === false) {
             throw new RuntimeException('could not decompress ' . $label . ' gzip payload');
         }
+
+        proxyLog('INFO', 'gzip payload decompressed', [
+            'label' => $label,
+            'compressed_bytes' => $downloadedBytes,
+            'decompressed_bytes' => strlen($body),
+        ]);
     } else {
         // cURL may already have decoded HTTP Content-Encoding gzip.
         $body = $downloaded;
@@ -407,6 +693,11 @@ function fetchGeoJsonDocument(array $config, string $url, string $label): array
     if (strlen($body) > $config['max_bytes']) {
         throw new RuntimeException($label . ' decompressed response exceeds MAX_BYTES');
     }
+
+    proxyLog('INFO', 'decoding GeoJSON JSON', [
+        'label' => $label,
+        'json_bytes' => strlen($body),
+    ]);
 
     try {
         $document = json_decode(
@@ -433,6 +724,14 @@ function fetchGeoJsonDocument(array $config, string $url, string $label): array
         throw new RuntimeException($label . ' has no valid GeoJSON type');
     }
 
+    proxyLog('INFO', 'GeoJSON JSON decoded', [
+        'label' => $label,
+        'geojson_type' => $document['type'],
+        'feature_count' => is_array($document['features'] ?? null)
+            ? count($document['features'])
+            : null,
+    ]);
+
     return $document;
 }
 
@@ -447,6 +746,7 @@ function fetchUrl(array $config, string $url): string
 
 function fetchUrlCurl(array $config, string $url): string
 {
+    proxyLog('INFO', 'HTTP request started with cURL', ['url' => $url]);
     $ch = curl_init($url);
 
     if ($ch === false) {
@@ -490,9 +790,22 @@ function fetchUrlCurl(array $config, string $url): string
 
     $ok = curl_exec($ch);
     $error = curl_error($ch);
-    $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $info = curl_getinfo($ch);
+    $status = (int) ($info['http_code'] ?? 0);
 
     curl_close($ch);
+
+    proxyLog('INFO', 'HTTP request completed with cURL', [
+        'url' => $url,
+        'effective_url' => $info['url'] ?? null,
+        'status' => $status,
+        'response_bytes' => strlen($body),
+        'content_type' => $info['content_type'] ?? null,
+        'redirect_count' => $info['redirect_count'] ?? null,
+        'total_seconds' => isset($info['total_time']) ? round((float) $info['total_time'], 3) : null,
+        'curl_ok' => $ok !== false,
+        'curl_error' => $error !== '' ? $error : null,
+    ]);
 
     if ($tooLarge) {
         throw new RuntimeException('remote response exceeds MAX_BYTES');
@@ -511,6 +824,8 @@ function fetchUrlCurl(array $config, string $url): string
 
 function fetchUrlFallback(array $config, string $url): string
 {
+    proxyLog('INFO', 'HTTP request started with file_get_contents', ['url' => $url]);
+
     if (!ini_get('allow_url_fopen')) {
         throw new RuntimeException('neither curl nor allow_url_fopen is available');
     }
@@ -548,6 +863,12 @@ function fetchUrlFallback(array $config, string $url): string
     }
 
     $status = parseHttpStatus($http_response_header ?? []);
+
+    proxyLog('INFO', 'HTTP request completed with file_get_contents', [
+        'url' => $url,
+        'status' => $status,
+        'response_bytes' => strlen($body),
+    ]);
 
     if ($status !== null && ($status < 200 || $status >= 300)) {
         throw new RuntimeException('remote source returned HTTP ' . $status);
@@ -594,15 +915,17 @@ function loadCache(array $config): ?array
 {
     $metaPath = $config['cache_dir'] . '/meta.json';
     $dataPath = $config['cache_dir'] . '/data.geojson';
+    $pointDataPath = $config['cache_dir'] . '/points.geojson';
 
-    if (!is_file($metaPath) || !is_file($dataPath)) {
+    if (!is_file($metaPath) || !is_file($dataPath) || !is_file($pointDataPath)) {
         return null;
     }
 
     $metaRaw = file_get_contents($metaPath);
     $body = file_get_contents($dataPath);
+    $pointBody = file_get_contents($pointDataPath);
 
-    if ($metaRaw === false || $body === false) {
+    if ($metaRaw === false || $body === false || $pointBody === false) {
         return null;
     }
 
@@ -614,6 +937,7 @@ function loadCache(array $config): ?array
 
     foreach ([
         'etag',
+        'point_etag',
         'cache_key',
         'fetched_at',
         'expires_at',
@@ -628,42 +952,65 @@ function loadCache(array $config): ?array
         return null;
     }
 
+    if (
+        !hash_equals((string) $meta['etag'], makeETag($body))
+        || !hash_equals((string) $meta['point_etag'], makeETag($pointBody))
+    ) {
+        return null;
+    }
+
     return [
         'body' => $body,
+        'point_body' => $pointBody,
         'etag' => (string) $meta['etag'],
+        'point_etag' => (string) $meta['point_etag'],
         'fetched_at' => (int) $meta['fetched_at'],
         'expires_at' => (int) $meta['expires_at'],
         'stale_until' => (int) $meta['stale_until'],
     ];
 }
 
-function saveCache(array $config, string $body): array
+function saveCache(array $config, string $body, string $pointBody): array
 {
+    proxyLog('INFO', 'cache write started', [
+        'data_path' => $config['cache_dir'] . '/data.geojson',
+        'point_data_path' => $config['cache_dir'] . '/points.geojson',
+        'meta_path' => $config['cache_dir'] . '/meta.json',
+        'body_bytes' => strlen($body),
+        'point_body_bytes' => strlen($pointBody),
+    ]);
+
     $now = time();
 
     $entry = [
         'body' => $body,
+        'point_body' => $pointBody,
         'etag' => makeETag($body),
+        'point_etag' => makeETag($pointBody),
         'fetched_at' => $now,
         'expires_at' => $now + $config['cache_ttl'],
         'stale_until' => $now + $config['cache_ttl'] + $config['stale_ttl'],
     ];
 
     $dataPath = $config['cache_dir'] . '/data.geojson';
+    $pointDataPath = $config['cache_dir'] . '/points.geojson';
     $metaPath = $config['cache_dir'] . '/meta.json';
 
     $suffix = '.' . getmypid() . '.' . bin2hex(random_bytes(4)) . '.tmp';
     $tmpData = $dataPath . $suffix;
+    $tmpPointData = $pointDataPath . $suffix;
     $tmpMeta = $metaPath . $suffix;
 
     $meta = [
         'version' => VERSION,
         'cache_key' => makeCacheKey($config),
         'etag' => $entry['etag'],
+        'point_etag' => $entry['point_etag'],
         'fetched_at' => $entry['fetched_at'],
         'expires_at' => $entry['expires_at'],
         'stale_until' => $entry['stale_until'],
         'bytes' => strlen($body),
+        'point_bytes' => strlen($pointBody),
     ];
 
     $metaJson = json_encode(
@@ -675,21 +1022,44 @@ function saveCache(array $config, string $body): array
         throw new RuntimeException('could not write cache data');
     }
 
+    if (file_put_contents($tmpPointData, $pointBody, LOCK_EX) === false) {
+        @unlink($tmpData);
+        throw new RuntimeException('could not write point cache data');
+    }
+
     if (file_put_contents($tmpMeta, $metaJson, LOCK_EX) === false) {
         @unlink($tmpData);
+        @unlink($tmpPointData);
         throw new RuntimeException('could not write cache metadata');
     }
 
     if (!rename($tmpData, $dataPath)) {
         @unlink($tmpData);
+        @unlink($tmpPointData);
         @unlink($tmpMeta);
         throw new RuntimeException('could not activate cache data');
+    }
+
+    if (!rename($tmpPointData, $pointDataPath)) {
+        @unlink($tmpPointData);
+        @unlink($tmpMeta);
+        throw new RuntimeException('could not activate point cache data');
     }
 
     if (!rename($tmpMeta, $metaPath)) {
         @unlink($tmpMeta);
         throw new RuntimeException('could not activate cache metadata');
     }
+
+    proxyLog('INFO', 'cache write completed', [
+        'data_path' => $dataPath,
+        'point_data_path' => $pointDataPath,
+        'meta_path' => $metaPath,
+        'body_bytes' => strlen($body),
+        'point_body_bytes' => strlen($pointBody),
+        'etag' => $entry['etag'],
+        'point_etag' => $entry['point_etag'],
+    ]);
 
     return $entry;
 }
@@ -698,19 +1068,43 @@ function makeCacheKey(array $config): string
 {
     return hash(
         'sha256',
-        VERSION . "\n" . $config['source_url'] . "\n" . $config['buffer_url']
+        VERSION
+        . "\n" . $config['source_url']
+        . "\n" . $config['buffer_url']
+        . "\n" . $config['transport_mode_property']
+        . "\n" . json_encode(
+            $config['allowed_transport_mode_types'],
+            JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+        )
     );
 }
 
-function serveCache(array $entry, string $cacheStatus, string $method): void
-{
+function serveCache(
+    array $entry,
+    string $cacheStatus,
+    string $method,
+    string $geometryMode
+): void {
+    $pointMode = $geometryMode === 'point';
+    $body = $pointMode ? $entry['point_body'] : $entry['body'];
+    $etag = $pointMode ? $entry['point_etag'] : $entry['etag'];
+
+    proxyLog('INFO', 'serving response', [
+        'cache_status' => $cacheStatus,
+        'method' => $method,
+        'geometry_mode' => $geometryMode,
+        'response_bytes' => strlen($body),
+        'etag' => $etag,
+    ]);
+
     setCORSHeaders();
 
     $remainingTtl = max(0, $entry['expires_at'] - time());
 
     header('Content-Type: application/geo+json; charset=utf-8');
-    header('ETag: ' . $entry['etag']);
+    header('ETag: ' . $etag);
     header('X-Cache: ' . $cacheStatus);
+    header('X-Geometry-Mode: ' . $geometryMode);
     header('X-Cache-Fetched-At: ' . gmdate(DATE_ATOM, $entry['fetched_at']));
     header('Age: ' . max(0, time() - $entry['fetched_at']));
 
@@ -722,19 +1116,19 @@ function serveCache(array $entry, string $cacheStatus, string $method): void
 
     $ifNoneMatch = $_SERVER['HTTP_IF_NONE_MATCH'] ?? '';
 
-    if (etagHeaderMatches($ifNoneMatch, $entry['etag'])) {
+    if (etagHeaderMatches($ifNoneMatch, $etag)) {
         http_response_code(304);
         return;
     }
 
     http_response_code(200);
-    header('Content-Length: ' . strlen($entry['body']));
+    header('Content-Length: ' . strlen($body));
 
     if ($method === 'HEAD') {
         return;
     }
 
-    echo $entry['body'];
+    echo $body;
 }
 
 function etagHeaderMatches(string $header, string $etag): bool
@@ -808,12 +1202,244 @@ function parseDuration(string $value): int
 
 /*
 |--------------------------------------------------------------------------
+| Diagnostics and progress reporting
+|--------------------------------------------------------------------------
+*/
+
+function initializeDiagnostics(array $config, string $mode): void
+{
+    $requestId = sprintf(
+        '%s-%d-%s',
+        gmdate('YmdHis'),
+        getmypid(),
+        substr(hash('sha256', uniqid('', true)), 0, 8)
+    );
+
+    $GLOBALS['proxy_diagnostics'] = [
+        'enabled' => (bool) $config['debug_log_enabled'],
+        'log_file' => $config['log_file'],
+        'status_file' => $config['status_file'],
+        'request_id' => $requestId,
+        'started_at' => microtime(true),
+        'mode' => $mode,
+        'progress_every' => (int) $config['log_progress_every'],
+    ];
+
+    if (!$config['debug_log_enabled']) {
+        return;
+    }
+
+    @ini_set('log_errors', '1');
+    @ini_set('error_log', $config['log_file']);
+
+    // Keep a small reserve so a fatal memory error can still be logged.
+    $GLOBALS['proxy_fatal_memory_reserve'] = str_repeat('R', 128 * 1024);
+
+    register_shutdown_function(static function (): void {
+        unset($GLOBALS['proxy_fatal_memory_reserve']);
+
+        $error = error_get_last();
+        if ($error === null) {
+            return;
+        }
+
+        if (!in_array($error['type'], [
+            E_ERROR,
+            E_PARSE,
+            E_CORE_ERROR,
+            E_COMPILE_ERROR,
+            E_USER_ERROR,
+        ], true)) {
+            return;
+        }
+
+        proxyLog('FATAL', 'PHP terminated with a fatal error', [
+            'error_type' => $error['type'],
+            'message' => $error['message'],
+            'file' => $error['file'],
+            'line' => $error['line'],
+        ]);
+
+        writeProxyStatus('fatal-error', [
+            'error_type' => $error['type'],
+            'message' => $error['message'],
+            'file' => $error['file'],
+            'line' => $error['line'],
+        ]);
+    });
+
+    proxyLog('INFO', 'diagnostics initialized', [
+        'php_version' => PHP_VERSION,
+        'php_sapi' => PHP_SAPI,
+        'memory_limit' => ini_get('memory_limit'),
+        'max_execution_time' => ini_get('max_execution_time'),
+        'curl_available' => function_exists('curl_init'),
+        'gzdecode_available' => function_exists('gzdecode'),
+        'cache_dir' => $config['cache_dir'],
+    ]);
+}
+
+function proxyLog(string $level, string $message, array $context = []): void
+{
+    $diagnostics = $GLOBALS['proxy_diagnostics'] ?? null;
+
+    if (!is_array($diagnostics) || !($diagnostics['enabled'] ?? false)) {
+        return;
+    }
+
+    $record = array_merge([
+        'timestamp' => gmdate(DATE_ATOM),
+        'level' => strtoupper($level),
+        'request_id' => $diagnostics['request_id'] ?? null,
+        'mode' => $diagnostics['mode'] ?? null,
+        'elapsed_seconds' => round(
+            microtime(true) - (float) ($diagnostics['started_at'] ?? microtime(true)),
+            3
+        ),
+        'memory_mib' => round(memory_get_usage(true) / 1024 / 1024, 2),
+        'peak_memory_mib' => round(memory_get_peak_usage(true) / 1024 / 1024, 2),
+        'message' => $message,
+    ], $context);
+
+    $json = json_encode(
+        $record,
+        JSON_UNESCAPED_SLASHES
+        | JSON_UNESCAPED_UNICODE
+        | JSON_INVALID_UTF8_SUBSTITUTE
+    );
+
+    if ($json !== false) {
+        @file_put_contents(
+            (string) $diagnostics['log_file'],
+            $json . PHP_EOL,
+            FILE_APPEND | LOCK_EX
+        );
+    }
+}
+
+function setProxyStage(string $stage, array $context = []): void
+{
+    proxyLog('INFO', 'stage: ' . $stage, $context);
+    writeProxyStatus($stage, $context);
+}
+
+function writeProxyStatus(string $stage, array $context = []): void
+{
+    $diagnostics = $GLOBALS['proxy_diagnostics'] ?? null;
+
+    if (!is_array($diagnostics) || !($diagnostics['enabled'] ?? false)) {
+        return;
+    }
+
+    $status = array_merge([
+        'stage' => $stage,
+        'updated_at' => gmdate(DATE_ATOM),
+        'request_id' => $diagnostics['request_id'] ?? null,
+        'mode' => $diagnostics['mode'] ?? null,
+        'elapsed_seconds' => round(
+            microtime(true) - (float) ($diagnostics['started_at'] ?? microtime(true)),
+            3
+        ),
+        'memory_mib' => round(memory_get_usage(true) / 1024 / 1024, 2),
+        'peak_memory_mib' => round(memory_get_peak_usage(true) / 1024 / 1024, 2),
+    ], $context);
+
+    $json = json_encode(
+        $status,
+        JSON_PRETTY_PRINT
+        | JSON_UNESCAPED_SLASHES
+        | JSON_UNESCAPED_UNICODE
+        | JSON_INVALID_UTF8_SUBSTITUTE
+    );
+
+    if ($json === false) {
+        return;
+    }
+
+    $statusFile = (string) $diagnostics['status_file'];
+    $tmp = $statusFile . '.' . getmypid() . '.tmp';
+
+    if (@file_put_contents($tmp, $json, LOCK_EX) !== false) {
+        if (!@rename($tmp, $statusFile)) {
+            @unlink($tmp);
+        }
+    }
+}
+
+function logProxyException(string $message, Throwable $exception): void
+{
+    proxyLog('ERROR', $message, [
+        'exception' => get_class($exception),
+        'exception_message' => $exception->getMessage(),
+        'file' => $exception->getFile(),
+        'line' => $exception->getLine(),
+        'trace' => $exception->getTraceAsString(),
+    ]);
+}
+
+function serveStatus(array $config): void
+{
+    setCORSHeaders();
+    http_response_code(200);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+
+    $status = null;
+    if (is_file($config['status_file'])) {
+        $raw = file_get_contents($config['status_file']);
+        if ($raw !== false) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $status = $decoded;
+            }
+        }
+    }
+
+    $meta = null;
+    $metaPath = $config['cache_dir'] . '/meta.json';
+    if (is_file($metaPath)) {
+        $raw = file_get_contents($metaPath);
+        if ($raw !== false) {
+            $decoded = json_decode($raw, true);
+            if (is_array($decoded)) {
+                $meta = [
+                    'fetched_at' => isset($decoded['fetched_at'])
+                        ? gmdate(DATE_ATOM, (int) $decoded['fetched_at'])
+                        : null,
+                    'expires_at' => isset($decoded['expires_at'])
+                        ? gmdate(DATE_ATOM, (int) $decoded['expires_at'])
+                        : null,
+                    'stale_until' => isset($decoded['stale_until'])
+                        ? gmdate(DATE_ATOM, (int) $decoded['stale_until'])
+                        : null,
+                    'bytes' => $decoded['bytes'] ?? null,
+                    'etag' => $decoded['etag'] ?? null,
+                ];
+            }
+        }
+    }
+
+    echo json_encode([
+        'status_available' => $status !== null,
+        'current' => $status,
+        'cache' => [
+            'data_exists' => is_file($config['cache_dir'] . '/data.geojson'),
+            'meta_exists' => is_file($metaPath),
+            'metadata' => $meta,
+        ],
+        'log_file' => DEBUG_LOG_FILENAME,
+    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+}
+
+/*
+|--------------------------------------------------------------------------
 | Spatial filtering
 |--------------------------------------------------------------------------
 |
 | These routines implement topological intersection tests in pure PHP.
-| They do not calculate distances. Both datasets must therefore already use
-| the same coordinate reference system and coordinate order.
+| Buffer boundaries are indexed in a uniform grid. Point-in-polygon tests
+| use a separate Y-bucket index. This avoids comparing every source segment
+| with every buffer segment.
 |
 */
 
@@ -823,12 +1449,17 @@ function parseDuration(string $value): int
  *     1: array{
  *         source_features: int,
  *         retained_features: int,
- *         buffer_polygons: int
+ *         buffer_polygons: int,
+ *         buffer_segments: int
  *     }
  * }
  */
-function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
-{
+function filterGeoJsonByBuffers(
+    array $source,
+    array $bufferDocument,
+    string $transportModeProperty,
+    array $allowedTransportModeTypes
+): array {
     if (($source['type'] ?? null) !== 'FeatureCollection') {
         throw new RuntimeException('source GeoJSON must be a FeatureCollection');
     }
@@ -839,6 +1470,18 @@ function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
         throw new RuntimeException('source FeatureCollection has no valid features array');
     }
 
+    $allowedTransportModeLookup = createStringLookup($allowedTransportModeTypes);
+    $transportModeFilterEnabled = $allowedTransportModeLookup !== [];
+
+    proxyLog('INFO', 'transport-mode filter configured', [
+        'enabled' => $transportModeFilterEnabled,
+        'property' => $transportModeProperty,
+        'allowed_values' => $allowedTransportModeTypes,
+        'match_semantics' => 'any',
+        'case_sensitive' => true,
+    ]);
+
+    setProxyStage('preparing-buffer-polygons');
     $buffers = prepareBufferPolygons($bufferDocument);
 
     if ($buffers === []) {
@@ -847,21 +1490,87 @@ function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
         );
     }
 
+    $bufferSegmentCount = array_sum(array_map(
+        static fn(array $buffer): int => (int) $buffer['segment_count'],
+        $buffers
+    ));
+
+    proxyLog('INFO', 'buffer polygons prepared with spatial indexes', [
+        'buffer_polygons' => count($buffers),
+        'buffer_segments' => $bufferSegmentCount,
+        'boundary_grid_cells' => array_sum(array_map(
+            static fn(array $buffer): int => count($buffer['boundary_index']['cells']),
+            $buffers
+        )),
+    ]);
+
     $retained = [];
+    $totalFeatures = count($sourceFeatures);
+    $transportModeMatchedFeatures = 0;
+    $transportModeRejectedFeatures = 0;
+    $featuresWithoutValidGeometry = 0;
+    $spatiallyRejectedFeatures = 0;
+    $progressEvery = max(0, (int) ($GLOBALS['proxy_diagnostics']['progress_every'] ?? 0));
 
-    foreach ($sourceFeatures as $feature) {
+    setProxyStage('filtering', [
+        'processed_features' => 0,
+        'total_features' => $totalFeatures,
+        'retained_features' => 0,
+        'transport_mode_filter_enabled' => $transportModeFilterEnabled,
+        'transport_mode_matched_features' => 0,
+        'transport_mode_rejected_features' => 0,
+        'buffer_polygons' => count($buffers),
+        'buffer_segments' => $bufferSegmentCount,
+    ]);
+
+    foreach ($sourceFeatures as $featureIndex => $feature) {
         if (!is_array($feature)) {
+            $transportModeRejectedFeatures++;
             continue;
         }
 
-        $geometry = $feature['geometry'] ?? null;
+        if (!featureMatchesAllowedTransportModes(
+            $feature,
+            $transportModeProperty,
+            $allowedTransportModeLookup
+        )) {
+            $transportModeRejectedFeatures++;
+        } else {
+            $transportModeMatchedFeatures++;
 
-        if (!is_array($geometry)) {
-            continue;
+            $geometry = $feature['geometry'] ?? null;
+
+            if (!is_array($geometry)) {
+                $featuresWithoutValidGeometry++;
+            } elseif (geometryIntersectsAnyBuffer($geometry, $buffers)) {
+                $retained[] = $feature;
+            } else {
+                $spatiallyRejectedFeatures++;
+            }
         }
 
-        if (geometryIntersectsAnyBuffer($geometry, $buffers)) {
-            $retained[] = $feature;
+        $processed = $featureIndex + 1;
+        if (
+            $progressEvery > 0
+            && ($processed % $progressEvery === 0 || $processed === $totalFeatures)
+        ) {
+            $progress = [
+                'processed_features' => $processed,
+                'total_features' => $totalFeatures,
+                'retained_features' => count($retained),
+                'transport_mode_filter_enabled' => $transportModeFilterEnabled,
+                'transport_mode_matched_features' => $transportModeMatchedFeatures,
+                'transport_mode_rejected_features' => $transportModeRejectedFeatures,
+                'features_without_valid_geometry' => $featuresWithoutValidGeometry,
+                'spatially_rejected_features' => $spatiallyRejectedFeatures,
+                'buffer_polygons' => count($buffers),
+                'buffer_segments' => $bufferSegmentCount,
+                'percent' => $totalFeatures > 0
+                    ? round($processed * 100 / $totalFeatures, 1)
+                    : 100.0,
+            ];
+            proxyLog('INFO', 'spatial and attribute filter progress', $progress);
+            writeProxyStatus('filtering', $progress);
         }
     }
 
@@ -876,16 +1585,492 @@ function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
         [
             'source_features' => count($sourceFeatures),
             'retained_features' => count($retained),
+            'transport_mode_filter_enabled' => $transportModeFilterEnabled,
+            'transport_mode_property' => $transportModeProperty,
+            'allowed_transport_mode_types' => $allowedTransportModeTypes,
+            'transport_mode_matched_features' => $transportModeMatchedFeatures,
+            'transport_mode_rejected_features' => $transportModeRejectedFeatures,
+            'features_without_valid_geometry' => $featuresWithoutValidGeometry,
+            'spatially_rejected_features' => $spatiallyRejectedFeatures,
             'buffer_polygons' => count($buffers),
+            'buffer_segments' => $bufferSegmentCount,
         ],
     ];
+}
+
+/**
+ * Normalizes the configured transport-mode list once during startup.
+ *
+ * Empty strings are rejected. Duplicate values are removed and the result is
+ * sorted so a semantically identical configuration produces the same cache key.
+ * Matching against feature values remains exact and case-sensitive.
+ *
+ * @return array<int, string>
+ */
+/**
+ * Creates a second FeatureCollection where every retained feature is reduced
+ * to one representative Point. Feature IDs, properties, and foreign members
+ * are preserved; feature-level and collection-level bboxes are removed.
+ *
+ * Polygon centroids account for holes. Line centroids are weighted by segment
+ * length. Multi-geometries and GeometryCollections use the highest-dimensional
+ * non-empty components, matching common centroid semantics. Degenerate areas
+ * fall back to line or point centroids where possible.
+ *
+ * @return array{0: array, 1: array{point_features: int, point_features_omitted: int}}
+ */
+function createPointRepresentation(array $document): array
+{
+    if (($document['type'] ?? null) !== 'FeatureCollection') {
+        throw new RuntimeException('point representation requires a FeatureCollection');
+    }
+
+    $features = $document['features'] ?? null;
+
+    if (!is_array($features)) {
+        throw new RuntimeException('point representation requires a features array');
+    }
+
+    $pointFeatures = [];
+    $omitted = 0;
+
+    foreach ($features as $feature) {
+        if (!is_array($feature) || !is_array($feature['geometry'] ?? null)) {
+            $omitted++;
+            continue;
+        }
+
+        $point = representativePointForGeometry($feature['geometry']);
+
+        if ($point === null) {
+            $omitted++;
+            continue;
+        }
+
+        $pointFeature = $feature;
+        $pointFeature['geometry'] = [
+            'type' => 'Point',
+            'coordinates' => $point,
+        ];
+        unset($pointFeature['bbox']);
+        $pointFeatures[] = $pointFeature;
+    }
+
+    $result = $document;
+    $result['features'] = $pointFeatures;
+    unset($result['bbox']);
+
+    return [
+        $result,
+        [
+            'point_features' => count($pointFeatures),
+            'point_features_omitted' => $omitted,
+        ],
+    ];
+}
+
+/** @return array{0: float, 1: float}|null */
+function representativePointForGeometry(array $geometry): ?array
+{
+    $component = geometryCentroidComponent($geometry);
+
+    if ($component === null || $component['weight'] <= GEO_EPSILON) {
+        return null;
+    }
+
+    $x = $component['weighted_x'] / $component['weight'];
+    $y = $component['weighted_y'] / $component['weight'];
+
+    if (!is_finite($x) || !is_finite($y)) {
+        return null;
+    }
+
+    return [$x, $y];
+}
+
+/**
+ * @return array{dimension: int, weight: float, weighted_x: float, weighted_y: float}|null
+ */
+function geometryCentroidComponent(array $geometry): ?array
+{
+    $type = $geometry['type'] ?? null;
+    $coordinates = $geometry['coordinates'] ?? null;
+
+    switch ($type) {
+        case 'Point':
+            return is_array($coordinates) && isCoordinate($coordinates)
+                ? pointCentroidComponent([$coordinates])
+                : null;
+
+        case 'MultiPoint':
+            return is_array($coordinates)
+                ? pointCentroidComponent($coordinates)
+                : null;
+
+        case 'LineString':
+            return is_array($coordinates)
+                ? lineCentroidComponent($coordinates)
+                : null;
+
+        case 'MultiLineString':
+            $components = [];
+            foreach (is_array($coordinates) ? $coordinates : [] as $line) {
+                if (is_array($line)) {
+                    $components[] = lineCentroidComponent($line);
+                }
+            }
+            return combineCentroidComponents($components);
+
+        case 'Polygon':
+            return is_array($coordinates)
+                ? polygonCentroidComponent($coordinates)
+                : null;
+
+        case 'MultiPolygon':
+            $components = [];
+            foreach (is_array($coordinates) ? $coordinates : [] as $polygon) {
+                if (is_array($polygon)) {
+                    $components[] = polygonCentroidComponent($polygon);
+                }
+            }
+            return combineCentroidComponents($components);
+
+        case 'GeometryCollection':
+            $components = [];
+            foreach ($geometry['geometries'] ?? [] as $child) {
+                if (is_array($child)) {
+                    $components[] = geometryCentroidComponent($child);
+                }
+            }
+            return combineCentroidComponents($components);
+    }
+
+    return null;
+}
+
+/**
+ * @param array<int, array|null> $components
+ * @return array{dimension: int, weight: float, weighted_x: float, weighted_y: float}|null
+ */
+function combineCentroidComponents(array $components): ?array
+{
+    $dimension = null;
+    $weight = 0.0;
+    $weightedX = 0.0;
+    $weightedY = 0.0;
+
+    foreach ($components as $component) {
+        if (!is_array($component) || $component['weight'] <= GEO_EPSILON) {
+            continue;
+        }
+
+        if ($dimension === null || $component['dimension'] > $dimension) {
+            $dimension = $component['dimension'];
+            $weight = 0.0;
+            $weightedX = 0.0;
+            $weightedY = 0.0;
+        }
+
+        if ($component['dimension'] !== $dimension) {
+            continue;
+        }
+
+        $weight += $component['weight'];
+        $weightedX += $component['weighted_x'];
+        $weightedY += $component['weighted_y'];
+    }
+
+    if ($dimension === null || $weight <= GEO_EPSILON) {
+        return null;
+    }
+
+    return [
+        'dimension' => $dimension,
+        'weight' => $weight,
+        'weighted_x' => $weightedX,
+        'weighted_y' => $weightedY,
+    ];
+}
+
+/**
+ * @param array<int, array> $points
+ * @return array{dimension: int, weight: float, weighted_x: float, weighted_y: float}|null
+ */
+function pointCentroidComponent(array $points): ?array
+{
+    $count = 0;
+    $sumX = 0.0;
+    $sumY = 0.0;
+
+    foreach ($points as $point) {
+        if (!is_array($point) || !isCoordinate($point)) {
+            continue;
+        }
+
+        $sumX += (float) $point[0];
+        $sumY += (float) $point[1];
+        $count++;
+    }
+
+    if ($count === 0) {
+        return null;
+    }
+
+    return [
+        'dimension' => 0,
+        'weight' => (float) $count,
+        'weighted_x' => $sumX,
+        'weighted_y' => $sumY,
+    ];
+}
+
+/**
+ * @return array{dimension: int, weight: float, weighted_x: float, weighted_y: float}|null
+ */
+function lineCentroidComponent(array $line): ?array
+{
+    $length = 0.0;
+    $weightedX = 0.0;
+    $weightedY = 0.0;
+    $points = [];
+    $count = count($line);
+
+    for ($i = 0; $i < $count; $i++) {
+        $point = $line[$i] ?? null;
+        if (is_array($point) && isCoordinate($point)) {
+            $points[] = $point;
+        }
+    }
+
+    for ($i = 0; $i + 1 < $count; $i++) {
+        $a = $line[$i] ?? null;
+        $b = $line[$i + 1] ?? null;
+
+        if (!is_array($a) || !is_array($b) || !isCoordinate($a) || !isCoordinate($b)) {
+            continue;
+        }
+
+        $dx = (float) $b[0] - (float) $a[0];
+        $dy = (float) $b[1] - (float) $a[1];
+        $segmentLength = hypot($dx, $dy);
+
+        if ($segmentLength <= GEO_EPSILON) {
+            continue;
+        }
+
+        $length += $segmentLength;
+        $weightedX += (((float) $a[0] + (float) $b[0]) / 2.0) * $segmentLength;
+        $weightedY += (((float) $a[1] + (float) $b[1]) / 2.0) * $segmentLength;
+    }
+
+    if ($length > GEO_EPSILON) {
+        return [
+            'dimension' => 1,
+            'weight' => $length,
+            'weighted_x' => $weightedX,
+            'weighted_y' => $weightedY,
+        ];
+    }
+
+    return pointCentroidComponent($points);
+}
+
+/**
+ * @return array{dimension: int, weight: float, weighted_x: float, weighted_y: float}|null
+ */
+function polygonCentroidComponent(array $polygon): ?array
+{
+    $area = 0.0;
+    $weightedX = 0.0;
+    $weightedY = 0.0;
+    $lineComponents = [];
+
+    foreach ($polygon as $ringIndex => $ring) {
+        if (!is_array($ring)) {
+            continue;
+        }
+
+        $lineComponents[] = lineCentroidComponent($ring);
+        $ringComponent = ringAreaCentroidComponent($ring);
+
+        if ($ringComponent === null) {
+            continue;
+        }
+
+        $sign = $ringIndex === 0 ? 1.0 : -1.0;
+        $area += $sign * $ringComponent['weight'];
+        $weightedX += $sign * $ringComponent['weighted_x'];
+        $weightedY += $sign * $ringComponent['weighted_y'];
+    }
+
+    if ($area > GEO_EPSILON) {
+        return [
+            'dimension' => 2,
+            'weight' => $area,
+            'weighted_x' => $weightedX,
+            'weighted_y' => $weightedY,
+        ];
+    }
+
+    return combineCentroidComponents($lineComponents);
+}
+
+/**
+ * Returns an orientation-independent area centroid for one ring.
+ *
+ * @return array{dimension: int, weight: float, weighted_x: float, weighted_y: float}|null
+ */
+function ringAreaCentroidComponent(array $ring): ?array
+{
+    $points = [];
+
+    foreach ($ring as $point) {
+        if (is_array($point) && isCoordinate($point)) {
+            $points[] = $point;
+        }
+    }
+
+    $count = count($points);
+    if ($count < 3) {
+        return null;
+    }
+
+    $areaTwice = 0.0;
+    $centroidNumeratorX = 0.0;
+    $centroidNumeratorY = 0.0;
+
+    for ($i = 0; $i < $count; $i++) {
+        $a = $points[$i];
+        $b = $points[($i + 1) % $count];
+        $cross = (float) $a[0] * (float) $b[1]
+            - (float) $b[0] * (float) $a[1];
+
+        $areaTwice += $cross;
+        $centroidNumeratorX += ((float) $a[0] + (float) $b[0]) * $cross;
+        $centroidNumeratorY += ((float) $a[1] + (float) $b[1]) * $cross;
+    }
+
+    if (abs($areaTwice) <= GEO_EPSILON) {
+        return null;
+    }
+
+    $centroidX = $centroidNumeratorX / (3.0 * $areaTwice);
+    $centroidY = $centroidNumeratorY / (3.0 * $areaTwice);
+    $area = abs($areaTwice) / 2.0;
+
+    if (!is_finite($centroidX) || !is_finite($centroidY)) {
+        return null;
+    }
+
+    return [
+        'dimension' => 2,
+        'weight' => $area,
+        'weighted_x' => $centroidX * $area,
+        'weighted_y' => $centroidY * $area,
+    ];
+}
+
+function normalizeAllowedTransportModeTypes(array $values): array
+{
+    $normalized = [];
+
+    foreach ($values as $index => $value) {
+        if (!is_string($value)) {
+            throw new RuntimeException(sprintf(
+                'ALLOWED_TRANSPORT_MODE_TYPES entry %s must be a string',
+                (string) $index
+            ));
+        }
+
+        $value = trim($value);
+
+        if ($value === '') {
+            throw new RuntimeException(sprintf(
+                'ALLOWED_TRANSPORT_MODE_TYPES entry %s must not be empty',
+                (string) $index
+            ));
+        }
+
+        $normalized[$value] = true;
+    }
+
+    $result = array_keys($normalized);
+    sort($result, SORT_STRING);
+
+    return $result;
+}
+
+/**
+ * @param array<int, string> $values
+ * @return array<string, true>
+ */
+function createStringLookup(array $values): array
+{
+    $lookup = [];
+
+    foreach ($values as $value) {
+        $lookup[$value] = true;
+    }
+
+    return $lookup;
+}
+
+/**
+ * Returns true when the attribute filter is disabled or when at least one
+ * feature value occurs in the configured allow-list.
+ *
+ * The expected GeoJSON shape is:
+ *
+ *   properties[TRANSPORT_MODE_PROPERTY] = ['bus', 'tram', ...]
+ *
+ * A single string is accepted as a convenience, but an array of strings is
+ * the intended representation. Missing, null, or non-string values do not
+ * match when the filter is enabled.
+ *
+ * @param array<string, true> $allowedLookup
+ */
+function featureMatchesAllowedTransportModes(
+    array $feature,
+    string $propertyName,
+    array $allowedLookup
+): bool {
+    if ($allowedLookup === []) {
+        return true;
+    }
+
+    $properties = $feature['properties'] ?? null;
+
+    if (!is_array($properties) || !array_key_exists($propertyName, $properties)) {
+        return false;
+    }
+
+    $featureValues = $properties[$propertyName];
+
+    if (is_string($featureValues)) {
+        return isset($allowedLookup[trim($featureValues)]);
+    }
+
+    if (!is_array($featureValues)) {
+        return false;
+    }
+
+    foreach ($featureValues as $featureValue) {
+        if (is_string($featureValue) && isset($allowedLookup[trim($featureValue)])) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /**
  * @return array<int, array{
  *     coordinates: array,
  *     bbox: array{minX: float, minY: float, maxX: float, maxY: float},
- *     segments: array<int, array{0: array, 1: array}>
+ *     first_point: array|null,
+ *     rings: array,
+ *     boundary_index: array,
+ *     segment_count: int
  * }>
  */
 function prepareBufferPolygons(array $document): array
@@ -904,10 +2089,33 @@ function prepareBufferPolygons(array $document): array
             continue;
         }
 
+        $segments = polygonSegmentRecords($polygon);
+
+        if ($segments === []) {
+            continue;
+        }
+
+        $preparedRings = [];
+        foreach ($polygon as $ring) {
+            if (is_array($ring)) {
+                $preparedRing = prepareRingForPointTests($ring);
+                if ($preparedRing !== null) {
+                    $preparedRings[] = $preparedRing;
+                }
+            }
+        }
+
+        if ($preparedRings === []) {
+            continue;
+        }
+
         $prepared[] = [
             'coordinates' => $polygon,
             'bbox' => $bbox,
-            'segments' => polygonSegments($polygon),
+            'first_point' => firstPolygonPoint($polygon),
+            'rings' => $preparedRings,
+            'boundary_index' => buildSegmentGridIndex($segments, $bbox),
+            'segment_count' => count($segments),
         ];
     }
 
@@ -966,11 +2174,7 @@ function extractPolygonCoordinates(array $object): array
 }
 
 /**
- * @param array<int, array{
- *     coordinates: array,
- *     bbox: array,
- *     segments: array
- * }> $buffers
+ * @param array<int, array> $buffers
  */
 function geometryIntersectsAnyBuffer(array $geometry, array $buffers): bool
 {
@@ -1019,10 +2223,7 @@ function flattenGeometry(array $geometry): array
         case 'MultiPoint':
             foreach ($coordinates ?? [] as $point) {
                 if (is_array($point)) {
-                    $result[] = [
-                        'type' => 'Point',
-                        'coordinates' => $point,
-                    ];
+                    $result[] = ['type' => 'Point', 'coordinates' => $point];
                 }
             }
             break;
@@ -1030,10 +2231,7 @@ function flattenGeometry(array $geometry): array
         case 'MultiLineString':
             foreach ($coordinates ?? [] as $line) {
                 if (is_array($line)) {
-                    $result[] = [
-                        'type' => 'LineString',
-                        'coordinates' => $line,
-                    ];
+                    $result[] = ['type' => 'LineString', 'coordinates' => $line];
                 }
             }
             break;
@@ -1041,10 +2239,7 @@ function flattenGeometry(array $geometry): array
         case 'MultiPolygon':
             foreach ($coordinates ?? [] as $polygon) {
                 if (is_array($polygon)) {
-                    $result[] = [
-                        'type' => 'Polygon',
-                        'coordinates' => $polygon,
-                    ];
+                    $result[] = ['type' => 'Polygon', 'coordinates' => $polygon];
                 }
             }
             break;
@@ -1063,13 +2258,6 @@ function flattenGeometry(array $geometry): array
     return $result;
 }
 
-/**
- * @param array{
- *     coordinates: array,
- *     bbox: array,
- *     segments: array
- * } $buffer
- */
 function simpleGeometryIntersectsPreparedPolygon(array $geometry, array $buffer): bool
 {
     $type = $geometry['type'] ?? null;
@@ -1080,17 +2268,9 @@ function simpleGeometryIntersectsPreparedPolygon(array $geometry, array $buffer)
     }
 
     return match ($type) {
-        'Point' => pointInPolygon($coordinates, $buffer['coordinates']),
-        'LineString' => lineStringIntersectsPreparedPolygon(
-            $coordinates,
-            $buffer['coordinates'],
-            $buffer['segments']
-        ),
-        'Polygon' => polygonIntersectsPreparedPolygon(
-            $coordinates,
-            $buffer['coordinates'],
-            $buffer['segments']
-        ),
+        'Point' => pointInPreparedPolygon($coordinates, $buffer),
+        'LineString' => lineStringIntersectsPreparedPolygon($coordinates, $buffer),
+        'Polygon' => polygonIntersectsPreparedPolygon($coordinates, $buffer),
         default => false,
     };
 }
@@ -1131,12 +2311,7 @@ function expandBoundingBox(array $coordinates, ?array &$bbox): void
         }
 
         if ($bbox === null) {
-            $bbox = [
-                'minX' => $x,
-                'minY' => $y,
-                'maxX' => $x,
-                'maxY' => $y,
-            ];
+            $bbox = ['minX' => $x, 'minY' => $y, 'maxX' => $x, 'maxY' => $y];
             return;
         }
 
@@ -1164,9 +2339,153 @@ function boundingBoxesIntersect(array $a, array $b): bool
     );
 }
 
+function pointInPreparedPolygon(array $point, array $polygon): bool
+{
+    if (!isCoordinate($point) || !pointInBoundingBox($point, $polygon['bbox'])) {
+        return false;
+    }
+
+    $rings = $polygon['rings'];
+
+    if (!isset($rings[0]) || !pointInPreparedRing($point, $rings[0], true)) {
+        return false;
+    }
+
+    for ($i = 1, $count = count($rings); $i < $count; $i++) {
+        // A boundary of a hole is still part of the polygon boundary and must
+        // count as an intersection. Therefore boundaryCountsAsInside=false.
+        if (pointInPreparedRing($point, $rings[$i], false)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+function pointInBoundingBox(array $point, array $bbox): bool
+{
+    return (float) $point[0] >= $bbox['minX'] - GEO_EPSILON
+        && (float) $point[0] <= $bbox['maxX'] + GEO_EPSILON
+        && (float) $point[1] >= $bbox['minY'] - GEO_EPSILON
+        && (float) $point[1] <= $bbox['maxY'] + GEO_EPSILON;
+}
+
 /**
- * Point-in-polygon test supporting GeoJSON inner rings (holes).
- * Polygon boundaries count as intersection.
+ * Prepare a ring for fast repeated point-in-ring tests. Edges are assigned to
+ * horizontal buckets according to their Y extent.
+ */
+function prepareRingForPointTests(array $ring): ?array
+{
+    $records = ringSegmentRecords($ring);
+    $bbox = coordinatesBoundingBox($ring);
+
+    if ($records === [] || $bbox === null) {
+        return null;
+    }
+
+    $bucketCount = max(
+        1,
+        min(
+            POINT_INDEX_MAX_BUCKETS,
+            (int) ceil(count($records) / POINT_INDEX_TARGET_EDGES_PER_BUCKET)
+        )
+    );
+
+    if (($bbox['maxY'] - $bbox['minY']) <= GEO_EPSILON) {
+        $bucketCount = 1;
+    }
+
+    $buckets = [];
+    $overflow = [];
+
+    foreach ($records as $id => $record) {
+        $minBucket = pointIndexBucketForY($record['minY'], $bbox, $bucketCount);
+        $maxBucket = pointIndexBucketForY($record['maxY'], $bbox, $bucketCount);
+        $span = $maxBucket - $minBucket + 1;
+
+        if ($span > POINT_INDEX_MAX_BUCKETS_PER_EDGE) {
+            $overflow[] = $id;
+            continue;
+        }
+
+        for ($bucket = $minBucket; $bucket <= $maxBucket; $bucket++) {
+            $buckets[$bucket][] = $id;
+        }
+    }
+
+    return [
+        'bbox' => $bbox,
+        'segments' => $records,
+        'bucket_count' => $bucketCount,
+        'buckets' => $buckets,
+        'overflow' => $overflow,
+    ];
+}
+
+function pointIndexBucketForY(float $y, array $bbox, int $bucketCount): int
+{
+    if ($bucketCount <= 1 || ($bbox['maxY'] - $bbox['minY']) <= GEO_EPSILON) {
+        return 0;
+    }
+
+    $ratio = ($y - $bbox['minY']) / ($bbox['maxY'] - $bbox['minY']);
+    $bucket = (int) floor($ratio * $bucketCount);
+
+    return max(0, min($bucketCount - 1, $bucket));
+}
+
+function pointInPreparedRing(array $point, array $ring, bool $boundaryCountsAsInside): bool
+{
+    if (!pointInBoundingBox($point, $ring['bbox'])) {
+        return false;
+    }
+
+    $bucket = pointIndexBucketForY((float) $point[1], $ring['bbox'], $ring['bucket_count']);
+    $candidateIds = $ring['buckets'][$bucket] ?? [];
+
+    if ($ring['overflow'] !== []) {
+        foreach ($ring['overflow'] as $id) {
+            $candidateIds[] = $id;
+        }
+    }
+
+    $inside = false;
+
+    foreach ($candidateIds as $id) {
+        $segment = $ring['segments'][$id];
+        $a = $segment['a'];
+        $b = $segment['b'];
+
+        if (pointOnSegment($point, $a, $b)) {
+            return $boundaryCountsAsInside;
+        }
+
+        $crosses = (
+            ((float) $b[1] > (float) $point[1])
+            !== ((float) $a[1] > (float) $point[1])
+        );
+
+        if (!$crosses) {
+            continue;
+        }
+
+        $intersectionX =
+            ((float) $a[0] - (float) $b[0])
+            * ((float) $point[1] - (float) $b[1])
+            / ((float) $a[1] - (float) $b[1])
+            + (float) $b[0];
+
+        if ((float) $point[0] < $intersectionX) {
+            $inside = !$inside;
+        }
+    }
+
+    return $inside;
+}
+
+/**
+ * Raw point-in-polygon is retained for the one containment test where the
+ * prepared buffer's first point is tested against a source polygon.
  */
 function pointInPolygon(array $point, array $polygon): bool
 {
@@ -1178,8 +2497,6 @@ function pointInPolygon(array $point, array $polygon): bool
         return false;
     }
 
-    // A point inside a hole is outside the polygon. A point on a hole's
-    // boundary still intersects the polygon boundary and therefore remains true.
     for ($i = 1, $count = count($polygon); $i < $count; $i++) {
         if (is_array($polygon[$i]) && pointInRing($point, $polygon[$i], false)) {
             return false;
@@ -1234,98 +2551,178 @@ function pointInRing(array $point, array $ring, bool $boundaryCountsAsInside): b
     return $inside;
 }
 
-function lineStringIntersectsPreparedPolygon(
-    array $line,
-    array $polygon,
-    array $polygonSegments
-): bool {
-    foreach ($line as $point) {
-        if (is_array($point) && pointInPolygon($point, $polygon)) {
-            return true;
-        }
+function lineStringIntersectsPreparedPolygon(array $line, array $buffer): bool
+{
+    $firstPoint = firstLinePoint($line);
+
+    if ($firstPoint === null) {
+        return false;
     }
 
-    return segmentCollectionsIntersect(
-        lineSegments($line),
-        $polygonSegments
-    );
+    // For a connected line it is sufficient to test one point for containment.
+    // If a later part enters the polygon, it must cross a polygon boundary,
+    // which is detected by the indexed segment test below.
+    if (pointInPreparedPolygon($firstPoint, $buffer)) {
+        return true;
+    }
+
+    return lineBoundaryIntersectsIndex($line, $buffer['boundary_index']);
 }
 
-function polygonIntersectsPreparedPolygon(
-    array $sourcePolygon,
-    array $bufferPolygon,
-    array $bufferSegments
-): bool {
-    $sourceSegments = polygonSegments($sourcePolygon);
-
-    if (segmentCollectionsIntersect($sourceSegments, $bufferSegments)) {
+function polygonIntersectsPreparedPolygon(array $sourcePolygon, array $buffer): bool
+{
+    if (polygonBoundaryIntersectsIndex($sourcePolygon, $buffer['boundary_index'])) {
         return true;
     }
 
     $sourcePoint = firstPolygonPoint($sourcePolygon);
 
-    if ($sourcePoint !== null && pointInPolygon($sourcePoint, $bufferPolygon)) {
+    if ($sourcePoint !== null && pointInPreparedPolygon($sourcePoint, $buffer)) {
         return true;
     }
 
-    $bufferPoint = firstPolygonPoint($bufferPolygon);
+    $bufferPoint = $buffer['first_point'];
 
     return $bufferPoint !== null && pointInPolygon($bufferPoint, $sourcePolygon);
 }
 
-function firstPolygonPoint(array $polygon): ?array
+function firstLinePoint(array $line): ?array
 {
-    $point = $polygon[0][0] ?? null;
+    foreach ($line as $point) {
+        if (is_array($point) && isCoordinate($point)) {
+            return $point;
+        }
+    }
 
-    return is_array($point) && isCoordinate($point) ? $point : null;
+    return null;
 }
 
-/** @return array<int, array{0: array, 1: array}> */
-function polygonSegments(array $polygon): array
+function firstPolygonPoint(array $polygon): ?array
 {
-    $segments = [];
-
     foreach ($polygon as $ring) {
         if (!is_array($ring)) {
             continue;
         }
 
-        foreach (ringSegments($ring) as $segment) {
-            $segments[] = $segment;
+        foreach ($ring as $point) {
+            if (is_array($point) && isCoordinate($point)) {
+                return $point;
+            }
         }
     }
 
-    return $segments;
+    return null;
 }
 
-/** @return array<int, array{0: array, 1: array}> */
-function lineSegments(array $line): array
+function lineBoundaryIntersectsIndex(array $line, array $index): bool
 {
-    $segments = [];
     $count = count($line);
 
     for ($i = 0; $i + 1 < $count; $i++) {
         $a = $line[$i] ?? null;
         $b = $line[$i + 1] ?? null;
 
+        if (!is_array($a) || !is_array($b) || !isCoordinate($a) || !isCoordinate($b)) {
+            continue;
+        }
+
+        if (segmentIntersectsGridIndex($a, $b, $index)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function polygonBoundaryIntersectsIndex(array $polygon, array $index): bool
+{
+    foreach ($polygon as $ring) {
+        if (!is_array($ring)) {
+            continue;
+        }
+
+        if (ringBoundaryIntersectsIndex($ring, $index)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function ringBoundaryIntersectsIndex(array $ring, array $index): bool
+{
+    $count = count($ring);
+
+    for ($i = 0; $i + 1 < $count; $i++) {
+        $a = $ring[$i] ?? null;
+        $b = $ring[$i + 1] ?? null;
+
         if (
             is_array($a)
             && is_array($b)
             && isCoordinate($a)
             && isCoordinate($b)
+            && segmentIntersectsGridIndex($a, $b, $index)
         ) {
-            $segments[] = [$a, $b];
+            return true;
         }
     }
 
-    return $segments;
+    if ($count >= 3) {
+        $first = $ring[0] ?? null;
+        $last = $ring[$count - 1] ?? null;
+
+        if (
+            is_array($first)
+            && is_array($last)
+            && isCoordinate($first)
+            && isCoordinate($last)
+            && !pointsEqual($first, $last)
+            && segmentIntersectsGridIndex($last, $first, $index)
+        ) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
-/** @return array<int, array{0: array, 1: array}> */
-function ringSegments(array $ring): array
+/**
+ * @return array<int, array{a: array, b: array, minX: float, minY: float, maxX: float, maxY: float}>
+ */
+function polygonSegmentRecords(array $polygon): array
 {
-    $segments = lineSegments($ring);
+    $records = [];
+
+    foreach ($polygon as $ring) {
+        if (!is_array($ring)) {
+            continue;
+        }
+
+        foreach (ringSegmentRecords($ring) as $record) {
+            $records[] = $record;
+        }
+    }
+
+    return $records;
+}
+
+/**
+ * @return array<int, array{a: array, b: array, minX: float, minY: float, maxX: float, maxY: float}>
+ */
+function ringSegmentRecords(array $ring): array
+{
+    $records = [];
     $count = count($ring);
+
+    for ($i = 0; $i + 1 < $count; $i++) {
+        $a = $ring[$i] ?? null;
+        $b = $ring[$i + 1] ?? null;
+
+        if (is_array($a) && is_array($b) && isCoordinate($a) && isCoordinate($b)) {
+            $records[] = makeSegmentRecord($a, $b);
+        }
+    }
 
     if ($count >= 3) {
         $first = $ring[0] ?? null;
@@ -1338,20 +2735,174 @@ function ringSegments(array $ring): array
             && isCoordinate($last)
             && !pointsEqual($first, $last)
         ) {
-            $segments[] = [$last, $first];
+            $records[] = makeSegmentRecord($last, $first);
         }
     }
 
-    return $segments;
+    return $records;
 }
 
-function segmentCollectionsIntersect(array $segmentsA, array $segmentsB): bool
+function makeSegmentRecord(array $a, array $b): array
 {
-    foreach ($segmentsA as [$a1, $a2]) {
-        foreach ($segmentsB as [$b1, $b2]) {
-            if (segmentsIntersect($a1, $a2, $b1, $b2)) {
-                return true;
+    return [
+        'a' => $a,
+        'b' => $b,
+        'minX' => min((float) $a[0], (float) $b[0]),
+        'minY' => min((float) $a[1], (float) $b[1]),
+        'maxX' => max((float) $a[0], (float) $b[0]),
+        'maxY' => max((float) $a[1], (float) $b[1]),
+    ];
+}
+
+function buildSegmentGridIndex(array $segments, array $bbox): array
+{
+    $segmentCount = count($segments);
+    $width = $bbox['maxX'] - $bbox['minX'];
+    $height = $bbox['maxY'] - $bbox['minY'];
+
+    $targetCells = max(
+        1,
+        min(
+            SPATIAL_INDEX_MAX_TOTAL_CELLS,
+            (int) ceil($segmentCount / SPATIAL_INDEX_TARGET_SEGMENTS_PER_CELL)
+        )
+    );
+
+    if ($width <= GEO_EPSILON && $height <= GEO_EPSILON) {
+        $columns = 1;
+        $rows = 1;
+    } elseif ($height <= GEO_EPSILON) {
+        $columns = min(SPATIAL_INDEX_MAX_GRID_DIMENSION, max(1, $targetCells));
+        $rows = 1;
+    } elseif ($width <= GEO_EPSILON) {
+        $columns = 1;
+        $rows = min(SPATIAL_INDEX_MAX_GRID_DIMENSION, max(1, $targetCells));
+    } else {
+        $aspect = max(1.0 / 16.0, min(16.0, $width / $height));
+        $columns = (int) max(1, round(sqrt($targetCells * $aspect)));
+        $columns = min(SPATIAL_INDEX_MAX_GRID_DIMENSION, $columns);
+        $rows = (int) max(1, ceil($targetCells / $columns));
+        $rows = min(SPATIAL_INDEX_MAX_GRID_DIMENSION, $rows);
+    }
+
+    $cells = [];
+    $overflow = [];
+
+    foreach ($segments as $id => $segment) {
+        [$minColumn, $maxColumn, $minRow, $maxRow] = gridRangeForBoundingBox(
+            $segment,
+            $bbox,
+            $columns,
+            $rows
+        );
+
+        $cellSpan = ($maxColumn - $minColumn + 1) * ($maxRow - $minRow + 1);
+
+        if ($cellSpan > SPATIAL_INDEX_MAX_CELLS_PER_SEGMENT) {
+            $overflow[] = $id;
+            continue;
+        }
+
+        for ($row = $minRow; $row <= $maxRow; $row++) {
+            for ($column = $minColumn; $column <= $maxColumn; $column++) {
+                $cells[$row * $columns + $column][] = $id;
             }
+        }
+    }
+
+    return [
+        'bbox' => $bbox,
+        'columns' => $columns,
+        'rows' => $rows,
+        'cells' => $cells,
+        'overflow' => $overflow,
+        'segments' => $segments,
+    ];
+}
+
+function gridRangeForBoundingBox(
+    array $itemBbox,
+    array $gridBbox,
+    int $columns,
+    int $rows
+): array {
+    return [
+        gridColumnForX((float) $itemBbox['minX'], $gridBbox, $columns),
+        gridColumnForX((float) $itemBbox['maxX'], $gridBbox, $columns),
+        gridRowForY((float) $itemBbox['minY'], $gridBbox, $rows),
+        gridRowForY((float) $itemBbox['maxY'], $gridBbox, $rows),
+    ];
+}
+
+function gridColumnForX(float $x, array $bbox, int $columns): int
+{
+    if ($columns <= 1 || ($bbox['maxX'] - $bbox['minX']) <= GEO_EPSILON) {
+        return 0;
+    }
+
+    $ratio = ($x - $bbox['minX']) / ($bbox['maxX'] - $bbox['minX']);
+    $column = (int) floor($ratio * $columns);
+
+    return max(0, min($columns - 1, $column));
+}
+
+function gridRowForY(float $y, array $bbox, int $rows): int
+{
+    if ($rows <= 1 || ($bbox['maxY'] - $bbox['minY']) <= GEO_EPSILON) {
+        return 0;
+    }
+
+    $ratio = ($y - $bbox['minY']) / ($bbox['maxY'] - $bbox['minY']);
+    $row = (int) floor($ratio * $rows);
+
+    return max(0, min($rows - 1, $row));
+}
+
+function segmentIntersectsGridIndex(array $a, array $b, array $index): bool
+{
+    $segmentBbox = [
+        'minX' => min((float) $a[0], (float) $b[0]),
+        'minY' => min((float) $a[1], (float) $b[1]),
+        'maxX' => max((float) $a[0], (float) $b[0]),
+        'maxY' => max((float) $a[1], (float) $b[1]),
+    ];
+
+    if (!boundingBoxesIntersect($segmentBbox, $index['bbox'])) {
+        return false;
+    }
+
+    [$minColumn, $maxColumn, $minRow, $maxRow] = gridRangeForBoundingBox(
+        $segmentBbox,
+        $index['bbox'],
+        $index['columns'],
+        $index['rows']
+    );
+
+    $seen = [];
+
+    foreach ($index['overflow'] as $id) {
+        $seen[$id] = true;
+    }
+
+    for ($row = $minRow; $row <= $maxRow; $row++) {
+        for ($column = $minColumn; $column <= $maxColumn; $column++) {
+            $key = $row * $index['columns'] + $column;
+
+            foreach ($index['cells'][$key] ?? [] as $id) {
+                $seen[$id] = true;
+            }
+        }
+    }
+
+    foreach ($seen as $id => $_) {
+        $candidate = $index['segments'][$id];
+
+        if (!boundingBoxesIntersect($segmentBbox, $candidate)) {
+            continue;
+        }
+
+        if (segmentsIntersect($a, $b, $candidate['a'], $candidate['b'])) {
+            return true;
         }
     }
 
@@ -1360,7 +2911,6 @@ function segmentCollectionsIntersect(array $segmentsA, array $segmentsB): bool
 
 function segmentsIntersect(array $a, array $b, array $c, array $d): bool
 {
-    // Fast segment-bounding-box rejection.
     if (
         max((float) $a[0], (float) $b[0]) + GEO_EPSILON
             < min((float) $c[0], (float) $d[0])
@@ -1405,11 +2955,7 @@ function oppositeSigns(float $a, float $b): bool
 
 function pointOnSegment(array $point, array $a, array $b): bool
 {
-    if (
-        !isCoordinate($point)
-        || !isCoordinate($a)
-        || !isCoordinate($b)
-    ) {
+    if (!isCoordinate($point) || !isCoordinate($a) || !isCoordinate($b)) {
         return false;
     }
 

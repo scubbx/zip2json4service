@@ -12,13 +12,17 @@ Covered behavior:
   GeometryCollection features are spatially filtered;
 * polygon holes and boundary intersections are handled;
 * multiple buffer polygons, MultiPolygon, and GeometryCollection buffers work;
+* full and centroid-like point representations are generated in one refresh;
 * the filtered result, rather than the unfiltered source, is cached;
-* cache MISS, HIT, ETag/304, HEAD, OPTIONS, and 405 behavior works;
+* both representations have separate ETags and support 304 and HEAD;
+* cache MISS, HIT, OPTIONS, 400, and 405 behavior works;
 * changing the buffer is picked up only after the cache TTL expires;
 * failures of either source URL or buffer URL serve stale cache data;
 * --warm-cache refreshes the filtered cache;
 * an invalid buffer dataset without polygons produces HTTP 502 when no stale
-  cache is available.
+  cache is available;
+* the optional affected-transportmode-types allow-list uses OR semantics,
+  rejects missing/non-matching values, and participates in cache invalidation.
 """
 
 from __future__ import annotations
@@ -101,6 +105,16 @@ SOURCE_GEOJSON: dict[str, Any] = {
         feature(
             "polygon_overlaps",
             {"type": "Polygon", "coordinates": [square(9, 9, 12, 12)]},
+        ),
+        feature(
+            "polygon_with_hole_centroid",
+            {
+                "type": "Polygon",
+                "coordinates": [
+                    square(0, 0, 10, 10),
+                    square(6, 4, 8, 6),
+                ],
+            },
         ),
         feature(
             "polygon_only_in_hole",
@@ -188,6 +202,49 @@ SOURCE_GEOJSON: dict[str, Any] = {
 }
 
 
+TRANSPORT_MODE_VALUES: dict[str, Any] = {
+    "point_inside": ["bus", "tram"],
+    "point_outer_boundary": ["car"],
+    "point_hole_boundary": None,
+    "point_second_buffer": ["train"],
+    "point_third_buffer": ["BUS"],
+    # A single string is accepted for robustness, although a list is preferred.
+    "line_crosses": "bus",
+    "polygon_inside": ["tram"],
+    "polygon_contains_buffer": ["train", "ship"],
+    "polygon_overlaps": [],
+    "multipoint_hit": ["bus"],
+    "multiline_hit": ["plane"],
+    "multipolygon_hit": ["train"],
+    "geometrycollection_hit": ["bus", "train"],
+}
+
+for _feature in SOURCE_GEOJSON["features"]:
+    _feature_id = str(_feature.get("id"))
+    _value = TRANSPORT_MODE_VALUES.get(_feature_id, ["unrelated"])
+
+    if _value is None:
+        _feature["properties"].pop("affected-transportmode-types", None)
+    else:
+        _feature["properties"]["affected-transportmode-types"] = _value
+
+
+EXPECTED_ALLOWED_BUS_TRAIN_IDS = [
+    "point_inside",
+    "point_second_buffer",
+    "line_crosses",
+    "polygon_contains_buffer",
+    "multipoint_hit",
+    "multipolygon_hit",
+    "geometrycollection_hit",
+]
+
+EXPECTED_ALLOWED_TRAM_IDS = [
+    "point_inside",
+    "polygon_inside",
+]
+
+
 INITIAL_BUFFER_GEOJSON: dict[str, Any] = {
     "type": "FeatureCollection",
     "features": [
@@ -257,6 +314,7 @@ EXPECTED_INITIAL_IDS = [
     "polygon_inside",
     "polygon_contains_buffer",
     "polygon_overlaps",
+    "polygon_with_hole_centroid",
     "multipoint_hit",
     "multiline_hit",
     "multipolygon_hit",
@@ -423,6 +481,34 @@ def retained_ids(document: dict[str, Any]) -> list[str]:
     return [str(item.get("id")) for item in document.get("features", [])]
 
 
+def feature_by_id(document: dict[str, Any], feature_id: str) -> dict[str, Any]:
+    for item in document.get("features", []):
+        if str(item.get("id")) == feature_id:
+            return item
+    raise AssertionError(f"Feature not found: {feature_id}")
+
+
+def assert_point_close(
+    document: dict[str, Any],
+    feature_id: str,
+    expected: tuple[float, float],
+    tolerance: float = 1.0e-9,
+) -> None:
+    item = feature_by_id(document, feature_id)
+    geometry = item.get("geometry", {})
+    assert_eq(geometry.get("type"), "Point", f"{feature_id} geometry type")
+    coordinates = geometry.get("coordinates")
+    assert_true(
+        isinstance(coordinates, list) and len(coordinates) >= 2,
+        f"{feature_id} point coordinates",
+    )
+    assert_true(
+        abs(float(coordinates[0]) - expected[0]) <= tolerance
+        and abs(float(coordinates[1]) - expected[1]) <= tolerance,
+        f"{feature_id} coordinates: expected {expected!r}, got {coordinates!r}",
+    )
+
+
 def start_mock_server(port: int) -> ThreadingHTTPServer:
     server = ThreadingHTTPServer(("127.0.0.1", port), MockUpstreamHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -433,6 +519,10 @@ def start_mock_server(port: int) -> ThreadingHTTPServer:
 def php_string(value: str) -> str:
     """Encode a Python string as a single-quoted PHP string literal."""
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def php_string_array(values: list[str]) -> str:
+    return "[" + ", ".join(php_string(value) for value in values) + "]"
 
 
 def replace_php_constant(source: str, name: str, php_value: str) -> str:
@@ -455,6 +545,7 @@ def create_configured_php_copy(
     source_url: str,
     buffer_url: str,
     cache_dir: Path,
+    allowed_transport_mode_types: list[str] | None = None,
 ) -> None:
     source = original_script.read_text(encoding="utf-8")
 
@@ -466,6 +557,9 @@ def create_configured_php_copy(
         "STALE_TTL": php_string("20s"),
         "MAX_BYTES": str(10 * 1024 * 1024),
         "HTTP_TIMEOUT": "5",
+        "ALLOWED_TRANSPORT_MODE_TYPES": php_string_array(
+            allowed_transport_mode_types or []
+        ),
     }
 
     for name, value in replacements.items():
@@ -553,7 +647,7 @@ def wait_until_cache_expired(cache_dir: Path, timeout: float = 5.0) -> None:
 
 
 def clear_cache(cache_dir: Path) -> None:
-    for filename in ("data.geojson", "meta.json"):
+    for filename in ("data.geojson", "points.geojson", "meta.json"):
         path = cache_dir / filename
         if path.exists():
             path.unlink()
@@ -602,6 +696,7 @@ def run_tests(args: argparse.Namespace) -> None:
             )
 
             proxy_url = f"http://127.0.0.1:{php_port}/{configured_php_script.name}"
+            point_url = proxy_url + "?geometry=point"
 
             print("Test 1: first GET fetches both gzip files and spatially filters all supported geometry types")
             status, headers, initial_body = http_request("GET", proxy_url)
@@ -645,8 +740,10 @@ def run_tests(args: argparse.Namespace) -> None:
             )
 
             cache_data_path = cache_dir / "data.geojson"
+            cache_point_path = cache_dir / "points.geojson"
             cache_meta_path = cache_dir / "meta.json"
             assert_true(cache_data_path.is_file(), "filtered cache data should exist")
+            assert_true(cache_point_path.is_file(), "point cache data should exist")
             assert_true(cache_meta_path.is_file(), "cache metadata should exist")
             assert_eq(
                 cache_data_path.read_bytes(),
@@ -656,7 +753,68 @@ def run_tests(args: argparse.Namespace) -> None:
             cache_meta = json.loads(cache_meta_path.read_text(encoding="utf-8"))
             assert_eq(cache_meta["etag"], etag_initial, "cache metadata ETag")
             assert_eq(cache_meta["bytes"], len(initial_body), "cache metadata byte count")
+            assert_true(cache_meta.get("point_etag"), "point ETag should be stored")
+            assert_true(cache_meta.get("point_bytes", 0) > 0, "point byte count should be stored")
             assert_true(cache_meta.get("cache_key"), "cache key should be stored")
+
+            print("Test 1b: point mode uses the same refresh and returns one centroid-like Point per retained feature")
+            status, point_headers, initial_point_body = http_request("GET", point_url)
+            assert_eq(status, 200, "point GET status")
+            assert_eq(point_headers.get("x-cache"), "HIT", "point request should reuse fresh cache")
+            assert_eq(point_headers.get("x-geometry-mode"), "point", "point mode header")
+            assert_eq(MockState.counts(), (1, 1), "point request must not fetch upstream data")
+            assert_true(
+                point_headers.get("content-type", "").startswith("application/geo+json"),
+                "point Content-Type should be application/geo+json",
+            )
+
+            initial_point_document = json.loads(initial_point_body.decode("utf-8"))
+            assert_eq(
+                retained_ids(initial_point_document),
+                EXPECTED_INITIAL_IDS,
+                "point representation should retain the same feature order and IDs",
+            )
+            assert_true(
+                all(
+                    item.get("geometry", {}).get("type") == "Point"
+                    for item in initial_point_document["features"]
+                ),
+                "every point representation feature must have Point geometry",
+            )
+            assert_true(
+                all(
+                    item.get("properties", {}).get("keep_original_property") is True
+                    for item in initial_point_document["features"]
+                ),
+                "point representation should preserve original properties",
+            )
+            assert_eq(
+                initial_point_document.get("dataset"),
+                "spatial-filter-integration-test",
+                "point representation should preserve collection foreign members",
+            )
+            assert_point_close(initial_point_document, "point_inside", (1.0, 1.0))
+            assert_point_close(initial_point_document, "line_crosses", (0.0, 2.0))
+            assert_point_close(initial_point_document, "polygon_inside", (1.5, 1.5))
+            assert_point_close(initial_point_document, "multipoint_hit", (18.0, 18.0))
+            assert_point_close(initial_point_document, "multipolygon_hit", (35.75, 35.75))
+            assert_point_close(initial_point_document, "geometrycollection_hit", (19.75, 21.0))
+            assert_point_close(
+                initial_point_document,
+                "polygon_with_hole_centroid",
+                (472.0 / 96.0, 5.0),
+            )
+
+            point_etag_initial = point_headers.get("etag")
+            assert_true(point_etag_initial, "point ETag should be present")
+            assert_true(point_etag_initial != etag_initial, "full and point ETags should differ")
+            assert_eq(
+                cache_point_path.read_bytes(),
+                initial_point_body,
+                "point cache must contain the served point representation",
+            )
+            assert_eq(cache_meta["point_etag"], point_etag_initial, "point cache metadata ETag")
+            assert_eq(cache_meta["point_bytes"], len(initial_point_body), "point cache metadata byte count")
 
             print("Test 2: repeated requests during the TTL use only the filtered cache")
             status, headers, second_body = http_request("GET", proxy_url)
@@ -675,6 +833,15 @@ def run_tests(args: argparse.Namespace) -> None:
             assert_eq(body_304, b"", "304 response should have an empty body")
             assert_eq(MockState.counts(), (1, 1), "304 should not fetch upstream data")
 
+            status, headers, point_body_304 = http_request(
+                "GET",
+                point_url,
+                headers={"If-None-Match": point_etag_initial},
+            )
+            assert_eq(status, 304, "point If-None-Match status")
+            assert_eq(point_body_304, b"", "point 304 response should have an empty body")
+            assert_eq(MockState.counts(), (1, 1), "point 304 should not fetch upstream data")
+
             print("Test 4: HEAD returns filtered representation headers without a body")
             status, headers, head_body = http_request("HEAD", proxy_url)
             assert_eq(status, 200, "HEAD status")
@@ -685,6 +852,17 @@ def run_tests(args: argparse.Namespace) -> None:
                 "HEAD Content-Length",
             )
             assert_eq(head_body, b"", "HEAD response should have an empty body")
+
+            status, headers, point_head_body = http_request("HEAD", point_url)
+            assert_eq(status, 200, "point HEAD status")
+            assert_eq(headers.get("etag"), point_etag_initial, "point HEAD ETag")
+            assert_eq(headers.get("x-geometry-mode"), "point", "point HEAD mode")
+            assert_eq(
+                int(headers.get("content-length", "-1")),
+                len(initial_point_body),
+                "point HEAD Content-Length",
+            )
+            assert_eq(point_head_body, b"", "point HEAD response should have an empty body")
 
             print("Test 5: OPTIONS and unsupported methods return the expected HTTP metadata")
             status, headers, options_body = http_request("OPTIONS", proxy_url)
@@ -698,6 +876,18 @@ def run_tests(args: argparse.Namespace) -> None:
             assert_contains("GET", headers.get("allow", ""), "Allow header")
             post_error = json.loads(post_body.decode("utf-8"))
             assert_eq(post_error.get("error"), "method not allowed", "POST error message")
+
+            status, headers, invalid_geometry_body = http_request(
+                "GET", proxy_url + "?geometry=polygon"
+            )
+            assert_eq(status, 400, "invalid geometry parameter status")
+            invalid_geometry_error = json.loads(invalid_geometry_body.decode("utf-8"))
+            assert_eq(
+                invalid_geometry_error.get("error"),
+                "invalid geometry parameter",
+                "invalid geometry parameter error",
+            )
+            assert_eq(MockState.counts(), (1, 1), "invalid geometry parameter must not fetch upstream")
 
             print("Test 6: a changed buffer is not used before TTL expiry, then produces a newly filtered cache entry")
             with MockState.lock:
@@ -725,6 +915,15 @@ def run_tests(args: argparse.Namespace) -> None:
             assert_true(etag_moved, "refreshed ETag should exist")
             assert_true(etag_moved != etag_initial, "ETag should change when filtered output changes")
             assert_eq(cache_data_path.read_bytes(), moved_body, "cache should be replaced by refreshed filtered data")
+
+            status, moved_point_headers, moved_point_body = http_request("GET", point_url)
+            assert_eq(status, 200, "moved point GET status")
+            assert_eq(moved_point_headers.get("x-cache"), "HIT", "moved point request should use refreshed cache")
+            moved_point_document = json.loads(moved_point_body.decode("utf-8"))
+            assert_eq(retained_ids(moved_point_document), EXPECTED_MOVED_IDS, "moved point IDs")
+            assert_point_close(moved_point_document, "point_moved", (105.0, 105.0))
+            assert_point_close(moved_point_document, "line_moved", (100.0, 105.0))
+            assert_eq(cache_point_path.read_bytes(), moved_point_body, "point cache should also be refreshed")
 
             print("Test 7: source failure after expiry serves the last filtered result as stale")
             wait_until_cache_expired(cache_dir)
@@ -791,6 +990,8 @@ def run_tests(args: argparse.Namespace) -> None:
             )
             assert_eq(warm_result.returncode, 0, "--warm-cache exit status")
             assert_contains("cache refreshed", warm_result.stdout, "--warm-cache output")
+            assert_contains("point_etag:", warm_result.stdout, "--warm-cache point ETag output")
+            assert_contains("point_bytes:", warm_result.stdout, "--warm-cache point byte output")
             assert_contains("peak_memory_mib:", warm_result.stdout, "--warm-cache memory output")
             assert_eq(
                 MockState.counts(),
@@ -827,7 +1028,113 @@ def run_tests(args: argparse.Namespace) -> None:
                 "invalid-buffer request should fetch both datasets",
             )
             assert_true(not cache_data_path.exists(), "failed refresh must not create cache data")
+            assert_true(not cache_point_path.exists(), "failed refresh must not create point cache data")
             assert_true(not cache_meta_path.exists(), "failed refresh must not create cache metadata")
+
+            print("Test 11: a first request in point mode builds both cache representations and applies the transport filter")
+            php_output = stop_process(php_process)
+            php_process = None
+            MockState.reset()
+
+            transport_php_dir = tmp_dir / "php-transport"
+            transport_php_dir.mkdir()
+            transport_cache_dir = tmp_dir / "cache-transport"
+            transport_php_script = transport_php_dir / original_php_script.name
+            transport_php_port = get_free_port()
+
+            create_configured_php_copy(
+                original_script=original_php_script,
+                target_script=transport_php_script,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=transport_cache_dir,
+                allowed_transport_mode_types=["bus", "train"],
+            )
+            lint_php_script(php_bin, transport_php_script)
+            php_process = start_php_server(
+                php_bin=php_bin,
+                php_dir=transport_php_dir,
+                php_port=transport_php_port,
+            )
+            transport_proxy_url = (
+                f"http://127.0.0.1:{transport_php_port}/{transport_php_script.name}"
+            )
+
+            status, headers, transport_body = http_request(
+                "GET", transport_proxy_url + "?geometry=point"
+            )
+            assert_eq(status, 200, "transport-filter point GET status")
+            assert_eq(headers.get("x-cache"), "MISS", "transport-filter first point request")
+            assert_eq(headers.get("x-geometry-mode"), "point", "transport-filter point mode")
+            transport_document = json.loads(transport_body.decode("utf-8"))
+            assert_true(
+                all(
+                    item.get("geometry", {}).get("type") == "Point"
+                    for item in transport_document["features"]
+                ),
+                "first point request should return only Point geometries",
+            )
+            assert_eq(
+                retained_ids(transport_document),
+                EXPECTED_ALLOWED_BUS_TRAIN_IDS,
+                "transport filter should retain spatial hits matching bus OR train",
+            )
+            assert_true(
+                "point_outer_boundary" not in retained_ids(transport_document),
+                "spatial hit with a disallowed value must be removed",
+            )
+            assert_true(
+                "point_hole_boundary" not in retained_ids(transport_document),
+                "spatial hit with a missing property must be removed",
+            )
+            assert_true(
+                "point_third_buffer" not in retained_ids(transport_document),
+                "matching must remain case-sensitive",
+            )
+
+            print("Test 12: changing the allow-list invalidates an otherwise fresh cache")
+            first_transport_counts = MockState.counts()
+            old_transport_etag = headers.get("etag")
+            php_output += stop_process(php_process)
+            php_process = None
+
+            create_configured_php_copy(
+                original_script=original_php_script,
+                target_script=transport_php_script,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=transport_cache_dir,
+                allowed_transport_mode_types=["tram"],
+            )
+            lint_php_script(php_bin, transport_php_script)
+            php_process = start_php_server(
+                php_bin=php_bin,
+                php_dir=transport_php_dir,
+                php_port=transport_php_port,
+            )
+
+            status, headers, tram_body = http_request("GET", transport_proxy_url)
+            assert_eq(status, 200, "changed allow-list GET status")
+            assert_eq(
+                headers.get("x-cache"),
+                "MISS",
+                "changed allow-list must not reuse the old fresh cache",
+            )
+            assert_eq(
+                MockState.counts(),
+                (first_transport_counts[0] + 1, first_transport_counts[1] + 1),
+                "cache-key change should trigger both upstream downloads",
+            )
+            tram_document = json.loads(tram_body.decode("utf-8"))
+            assert_eq(
+                retained_ids(tram_document),
+                EXPECTED_ALLOWED_TRAM_IDS,
+                "changed allow-list output",
+            )
+            assert_true(
+                headers.get("etag") != old_transport_etag,
+                "changed attribute-filter result should receive a new ETag",
+            )
 
             print()
             print("All tests passed.")
