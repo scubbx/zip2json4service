@@ -19,8 +19,8 @@ Dadurch müssen Quellsegmente nicht mehr mit sämtlichen Puffersegmenten verglic
 ## Dateien
 
 ```text
-geojson-proxy-optimized.php   PHP-Proxy und räumlicher Filter
-test_geojson_proxy.py         Integrationstest
+geojson-proxy-transport-filter.php   PHP-Proxy, Attribut- und räumlicher Filter
+test_geojson_proxy_v13.py      Integrationstest
 README.md                     diese Dokumentation
 ```
 
@@ -37,7 +37,9 @@ BUFFER_URL (GeoJSON oder gzip) ─┘
                                             ↓
                          Raster- und Punktindizes aufbauen
                                             ↓
-                              Quell-Features räumlich filtern
+                         Quell-Features nach Transportmodus filtern
+                                            ↓
+                              verbleibende Features räumlich filtern
                                             ↓
                               cache/data.geojson + meta.json
                                             ↓
@@ -65,7 +67,7 @@ Bei einem etwa 6 MiB großen **entpackten** Quelldatensatz sollte ein üblicher 
 
 ## Installation
 
-1. `geojson-proxy-optimized.php` auf den Webspace kopieren.
+1. `geojson-proxy-transport-filter.php` auf den Webspace kopieren.
 2. Die Konstanten am Anfang der Datei anpassen.
 3. Sicherstellen, dass PHP das konfigurierte Cache-Verzeichnis anlegen oder beschreiben darf.
 4. Das Skript einmal im Browser oder mit `--warm-cache` aufrufen.
@@ -93,10 +95,13 @@ Alle veränderbaren Einstellungen befinden sich am Anfang der PHP-Datei.
 ### Quellen und Cache
 
 ```php
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 
 const SOURCE_URL = 'https://example.org/source.geojson.gz';
 const BUFFER_URL = 'https://example.org/buffer.geojson.gz';
+
+const TRANSPORT_MODE_PROPERTY = 'affected-transportmode-types';
+const ALLOWED_TRANSPORT_MODE_TYPES = ['bus', 'tram', 'train'];
 
 const CACHE_DIR = __DIR__ . '/cache';
 const CACHE_TTL = '15m';
@@ -112,6 +117,8 @@ const USER_AGENT = 'umap-geojson-spatial-filter/' . VERSION;
 | `VERSION` | Skriptversion und Bestandteil der Cache-Identität. |
 | `SOURCE_URL` | URL der GeoJSON-`FeatureCollection`, aus der Features gefiltert werden. |
 | `BUFFER_URL` | URL eines GeoJSON-Dokuments mit einem oder mehreren `Polygon`- beziehungsweise `MultiPolygon`-Puffern. |
+| `TRANSPORT_MODE_PROPERTY` | Name der Feature-Property, welche die Liste der Verkehrsmitteltypen enthält. |
+| `ALLOWED_TRANSPORT_MODE_TYPES` | Erlaubte Werte. Mindestens ein Wert muss im Feature vorkommen. Ein leeres Array deaktiviert den Attributfilter. Der Vergleich ist exakt und case-sensitive. |
 | `CACHE_DIR` | Lokales, durch PHP beschreibbares Cache-Verzeichnis. |
 | `CACHE_TTL` | Zeitraum, in dem das gefilterte Ergebnis als frisch gilt. |
 | `STALE_TTL` | Zusätzlicher Zeitraum, in dem ein abgelaufener Cache bei Refresh-Fehlern ausgeliefert werden darf. |
@@ -220,6 +227,52 @@ Unterstützte Geometrietypen der Quell-Features:
 - `GeometryCollection`
 
 Features ohne gültiges Geometrieobjekt werden nicht übernommen. Properties, Feature-IDs und fremde Mitglieder der ursprünglichen `FeatureCollection` bleiben erhalten. Eine vorhandene globale `bbox` wird entfernt, weil sie nach dem Filtern nicht mehr stimmen muss.
+
+### Zusätzlicher Transportmittel-Filter
+
+Optional kann vor der räumlichen Prüfung nach der Feature-Property
+`affected-transportmode-types` gefiltert werden:
+
+```json
+{
+  "type": "Feature",
+  "properties": {
+    "affected-transportmode-types": ["bus", "tram"]
+  },
+  "geometry": {
+    "type": "Point",
+    "coordinates": [14.2858, 48.3069]
+  }
+}
+```
+
+Die erlaubten Werte werden am Anfang der PHP-Datei konfiguriert:
+
+```php
+const TRANSPORT_MODE_PROPERTY = 'affected-transportmode-types';
+const ALLOWED_TRANSPORT_MODE_TYPES = ['bus', 'train'];
+```
+
+Die Semantik ist **ODER**: Das Feature wird für die anschließende räumliche
+Prüfung zugelassen, sobald mindestens einer seiner Werte in der Allow-List
+vorkommt. Im Beispiel treffen daher sowohl `['bus']` als auch
+`['tram', 'train']` zu.
+
+Der Vergleich ist exakt und unterscheidet Groß- und Kleinschreibung. `bus` und
+`BUS` sind daher unterschiedliche Werte. Fehlt die Property, ist sie `null`
+oder enthält sie keinen passenden String, wird das Feature verworfen.
+
+Ein einzelner String wird aus Robustheitsgründen ebenfalls akzeptiert. Die
+bevorzugte Datenform bleibt jedoch eine Liste von Strings.
+
+Mit einer leeren Allow-List wird dieser Filter vollständig deaktiviert:
+
+```php
+const ALLOWED_TRANSPORT_MODE_TYPES = [];
+```
+
+Die Attributprüfung findet **vor** der Geometrieprüfung statt. Nicht passende
+Features verursachen daher keine räumlichen Berechnungen.
 
 ### Pufferdatensatz
 
@@ -340,8 +393,10 @@ Die Cache-Metadaten berücksichtigen:
 - die Skriptversion
 - `SOURCE_URL`
 - `BUFFER_URL`
+- `TRANSPORT_MODE_PROPERTY`
+- die normalisierte Liste `ALLOWED_TRANSPORT_MODE_TYPES`
 
-Werden eine URL oder `VERSION` geändert, wird ein alter Cache nicht als passender Cache akzeptiert.
+Werden eine URL, die Allow-List oder `VERSION` geändert, wird ein alter Cache nicht als passender Cache akzeptiert.
 
 ## Verwendung im Browser und in uMap
 
@@ -519,7 +574,7 @@ Die Tests benötigen keinen Internetzugriff.
 ### Test ausführen
 
 ```bash
-python3 test_geojson_proxy.py ./geojson-proxy-optimized.php
+python3 test_geojson_proxy_v13.py ./geojson-proxy-transport-filter.php
 ```
 
 Alternativ:
@@ -532,20 +587,20 @@ chmod +x test_geojson_proxy.py
 Ein anderes PHP-Binary verwenden:
 
 ```bash
-python3 test_geojson_proxy.py ./geojson-proxy-optimized.php \
+python3 test_geojson_proxy_v13.py ./geojson-proxy-transport-filter.php \
   --php-bin /usr/local/bin/php
 ```
 
 PHP-Serverlog nach dem Test anzeigen:
 
 ```bash
-python3 test_geojson_proxy.py ./geojson-proxy-optimized.php \
+python3 test_geojson_proxy_v13.py ./geojson-proxy-transport-filter.php \
   --show-php-log
 ```
 
 ### Abgedeckte Testfälle
 
-Der Test führt die Gruppen `Test 0` bis `Test 10` aus:
+Der Test führt die Gruppen `Test 0` bis `Test 12` aus:
 
 0. Syntaxprüfung der temporär konfigurierten PHP-Datei mit `php -l`
 1. Abruf und Dekomprimierung beider gzip-Dateien sowie räumliche Filterung aller unterstützten Geometrietypen
@@ -558,6 +613,8 @@ Der Test führt die Gruppen `Test 0` bis `Test 10` aus:
 8. Ausfall der Puffer-URL führt ebenfalls zur Auslieferung des alten Caches
 9. erfolgreiche Erholung sowie erzwungener Neuaufbau mit `--warm-cache`
 10. ungültiger Pufferdatensatz führt ohne alten Cache zu HTTP 502
+11. ODER-Filterung nach `affected-transportmode-types`, einschließlich fehlender Property und case-sensitive Matching
+12. Änderung der Allow-List invalidiert einen ansonsten frischen Cache
 
 Die Geometrietests enthalten unter anderem:
 

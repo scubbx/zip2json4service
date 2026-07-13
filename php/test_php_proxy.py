@@ -18,7 +18,9 @@ Covered behavior:
 * failures of either source URL or buffer URL serve stale cache data;
 * --warm-cache refreshes the filtered cache;
 * an invalid buffer dataset without polygons produces HTTP 502 when no stale
-  cache is available.
+  cache is available;
+* the optional affected-transportmode-types allow-list uses OR semantics,
+  rejects missing/non-matching values, and participates in cache invalidation.
 """
 
 from __future__ import annotations
@@ -186,6 +188,49 @@ SOURCE_GEOJSON: dict[str, Any] = {
         feature("null_geometry", None),
     ],
 }
+
+
+TRANSPORT_MODE_VALUES: dict[str, Any] = {
+    "point_inside": ["bus", "tram"],
+    "point_outer_boundary": ["car"],
+    "point_hole_boundary": None,
+    "point_second_buffer": ["train"],
+    "point_third_buffer": ["BUS"],
+    # A single string is accepted for robustness, although a list is preferred.
+    "line_crosses": "bus",
+    "polygon_inside": ["tram"],
+    "polygon_contains_buffer": ["train", "ship"],
+    "polygon_overlaps": [],
+    "multipoint_hit": ["bus"],
+    "multiline_hit": ["plane"],
+    "multipolygon_hit": ["train"],
+    "geometrycollection_hit": ["bus", "train"],
+}
+
+for _feature in SOURCE_GEOJSON["features"]:
+    _feature_id = str(_feature.get("id"))
+    _value = TRANSPORT_MODE_VALUES.get(_feature_id, ["unrelated"])
+
+    if _value is None:
+        _feature["properties"].pop("affected-transportmode-types", None)
+    else:
+        _feature["properties"]["affected-transportmode-types"] = _value
+
+
+EXPECTED_ALLOWED_BUS_TRAIN_IDS = [
+    "point_inside",
+    "point_second_buffer",
+    "line_crosses",
+    "polygon_contains_buffer",
+    "multipoint_hit",
+    "multipolygon_hit",
+    "geometrycollection_hit",
+]
+
+EXPECTED_ALLOWED_TRAM_IDS = [
+    "point_inside",
+    "polygon_inside",
+]
 
 
 INITIAL_BUFFER_GEOJSON: dict[str, Any] = {
@@ -435,6 +480,10 @@ def php_string(value: str) -> str:
     return "'" + value.replace("\\", "\\\\").replace("'", "\\'") + "'"
 
 
+def php_string_array(values: list[str]) -> str:
+    return "[" + ", ".join(php_string(value) for value in values) + "]"
+
+
 def replace_php_constant(source: str, name: str, php_value: str) -> str:
     pattern = re.compile(
         rf"^const\s+{re.escape(name)}\s*=\s*.*?;\s*$",
@@ -455,6 +504,7 @@ def create_configured_php_copy(
     source_url: str,
     buffer_url: str,
     cache_dir: Path,
+    allowed_transport_mode_types: list[str] | None = None,
 ) -> None:
     source = original_script.read_text(encoding="utf-8")
 
@@ -466,6 +516,9 @@ def create_configured_php_copy(
         "STALE_TTL": php_string("20s"),
         "MAX_BYTES": str(10 * 1024 * 1024),
         "HTTP_TIMEOUT": "5",
+        "ALLOWED_TRANSPORT_MODE_TYPES": php_string_array(
+            allowed_transport_mode_types or []
+        ),
     }
 
     for name, value in replacements.items():
@@ -828,6 +881,101 @@ def run_tests(args: argparse.Namespace) -> None:
             )
             assert_true(not cache_data_path.exists(), "failed refresh must not create cache data")
             assert_true(not cache_meta_path.exists(), "failed refresh must not create cache metadata")
+
+            print("Test 11: transport-mode allow-list uses OR semantics before spatial filtering")
+            php_output = stop_process(php_process)
+            php_process = None
+            MockState.reset()
+
+            transport_php_dir = tmp_dir / "php-transport"
+            transport_php_dir.mkdir()
+            transport_cache_dir = tmp_dir / "cache-transport"
+            transport_php_script = transport_php_dir / original_php_script.name
+            transport_php_port = get_free_port()
+
+            create_configured_php_copy(
+                original_script=original_php_script,
+                target_script=transport_php_script,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=transport_cache_dir,
+                allowed_transport_mode_types=["bus", "train"],
+            )
+            lint_php_script(php_bin, transport_php_script)
+            php_process = start_php_server(
+                php_bin=php_bin,
+                php_dir=transport_php_dir,
+                php_port=transport_php_port,
+            )
+            transport_proxy_url = (
+                f"http://127.0.0.1:{transport_php_port}/{transport_php_script.name}"
+            )
+
+            status, headers, transport_body = http_request("GET", transport_proxy_url)
+            assert_eq(status, 200, "transport-filter GET status")
+            assert_eq(headers.get("x-cache"), "MISS", "transport-filter first request")
+            transport_document = json.loads(transport_body.decode("utf-8"))
+            assert_eq(
+                retained_ids(transport_document),
+                EXPECTED_ALLOWED_BUS_TRAIN_IDS,
+                "transport filter should retain spatial hits matching bus OR train",
+            )
+            assert_true(
+                "point_outer_boundary" not in retained_ids(transport_document),
+                "spatial hit with a disallowed value must be removed",
+            )
+            assert_true(
+                "point_hole_boundary" not in retained_ids(transport_document),
+                "spatial hit with a missing property must be removed",
+            )
+            assert_true(
+                "point_third_buffer" not in retained_ids(transport_document),
+                "matching must remain case-sensitive",
+            )
+
+            print("Test 12: changing the allow-list invalidates an otherwise fresh cache")
+            first_transport_counts = MockState.counts()
+            old_transport_etag = headers.get("etag")
+            php_output += stop_process(php_process)
+            php_process = None
+
+            create_configured_php_copy(
+                original_script=original_php_script,
+                target_script=transport_php_script,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=transport_cache_dir,
+                allowed_transport_mode_types=["tram"],
+            )
+            lint_php_script(php_bin, transport_php_script)
+            php_process = start_php_server(
+                php_bin=php_bin,
+                php_dir=transport_php_dir,
+                php_port=transport_php_port,
+            )
+
+            status, headers, tram_body = http_request("GET", transport_proxy_url)
+            assert_eq(status, 200, "changed allow-list GET status")
+            assert_eq(
+                headers.get("x-cache"),
+                "MISS",
+                "changed allow-list must not reuse the old fresh cache",
+            )
+            assert_eq(
+                MockState.counts(),
+                (first_transport_counts[0] + 1, first_transport_counts[1] + 1),
+                "cache-key change should trigger both upstream downloads",
+            )
+            tram_document = json.loads(tram_body.decode("utf-8"))
+            assert_eq(
+                retained_ids(tram_document),
+                EXPECTED_ALLOWED_TRAM_IDS,
+                "changed allow-list output",
+            )
+            assert_true(
+                headers.get("etag") != old_transport_etag,
+                "changed attribute-filter result should receive a new ETag",
+            )
 
             print()
             print("All tests passed.")

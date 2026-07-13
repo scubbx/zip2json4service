@@ -21,7 +21,7 @@ declare(strict_types=1);
 |
 */
 
-const VERSION = '1.2.0';
+const VERSION = '1.3.0';
 
 /**
  * Main source dataset containing all features.
@@ -34,6 +34,28 @@ const SOURCE_URL = 'https://example.org/source.geojson.gz';
  * The response may be gzip-compressed or plain GeoJSON.
  */
 const BUFFER_URL = 'https://example.org/buffer.geojson.gz';
+
+/**
+ * Feature property containing the transport-mode list.
+ */
+const TRANSPORT_MODE_PROPERTY = 'affected-transportmode-types';
+
+/**
+ * Allowed transport-mode values.
+ *
+ * A feature passes this attribute filter when at least one value from its
+ * properties[TRANSPORT_MODE_PROPERTY] list occurs in this array.
+ *
+ * Leave the array empty to disable the attribute filter and retain all
+ * transport modes that pass the spatial filter.
+ *
+ * Matching is exact and case-sensitive.
+ *
+ * Example:
+ *
+ * const ALLOWED_TRANSPORT_MODE_TYPES = ['bus', 'tram', 'train'];
+ */
+const ALLOWED_TRANSPORT_MODE_TYPES = [];
 
 /** Writable cache directory. */
 const CACHE_DIR = __DIR__ . '/cache';
@@ -61,7 +83,7 @@ const USER_AGENT = 'umap-geojson-spatial-filter/' . VERSION;
 const GEO_EPSILON = 1.0e-12;
 
 /** Write detailed processing information into CACHE_DIR/proxy.log. */
-const DEBUG_LOG_ENABLED = false;
+const DEBUG_LOG_ENABLED = true;
 
 /** Log file name inside CACHE_DIR. */
 const DEBUG_LOG_FILENAME = 'proxy.log';
@@ -111,6 +133,10 @@ function loadConfig(): array
     return [
         'source_url' => SOURCE_URL,
         'buffer_url' => BUFFER_URL,
+        'transport_mode_property' => TRANSPORT_MODE_PROPERTY,
+        'allowed_transport_mode_types' => normalizeAllowedTransportModeTypes(
+            ALLOWED_TRANSPORT_MODE_TYPES
+        ),
         'cache_dir' => CACHE_DIR,
         'cache_ttl' => parseDuration(CACHE_TTL),
         'stale_ttl' => parseDuration(STALE_TTL),
@@ -332,6 +358,12 @@ Configuration:
 
   SOURCE_URL     Source FeatureCollection containing all objects.
   BUFFER_URL     GeoJSON containing Polygon or MultiPolygon buffers.
+  TRANSPORT_MODE_PROPERTY
+                 Feature property containing the transport-mode list.
+  ALLOWED_TRANSPORT_MODE_TYPES
+                 Exact, case-sensitive values allowed by the attribute filter.
+                 At least one configured value must occur in a feature. An
+                 empty array disables this additional attribute filter.
   CACHE_DIR      Writable cache directory.
   CACHE_TTL      Fresh result-cache lifetime.
   STALE_TTL      Stale-cache lifetime after refresh errors.
@@ -377,6 +409,8 @@ Notes:
   Both remote responses may be gzip-compressed or plain GeoJSON.
   Gzip is detected from the response body's gzip magic bytes.
   The source GeoJSON must be a FeatureCollection.
+  When ALLOWED_TRANSPORT_MODE_TYPES is not empty, a feature must have a
+  matching string in properties[TRANSPORT_MODE_PROPERTY].
   Buffer data may be a Geometry, Feature, FeatureCollection, or
   GeometryCollection containing Polygon or MultiPolygon geometries.
   Both datasets must use the same coordinate reference system.
@@ -406,6 +440,14 @@ function validateConfig(array $config): void
         if (!in_array($scheme, ['http', 'https'], true)) {
             throw new RuntimeException($name . ' must use HTTP or HTTPS');
         }
+    }
+
+    if (trim((string) $config['transport_mode_property']) === '') {
+        throw new RuntimeException('TRANSPORT_MODE_PROPERTY must not be empty');
+    }
+
+    if (!is_array($config['allowed_transport_mode_types'])) {
+        throw new RuntimeException('ALLOWED_TRANSPORT_MODE_TYPES must be an array');
     }
 
     if ($config['cache_ttl'] <= 0) {
@@ -461,7 +503,9 @@ function fetchAndPrepare(array $config): string
     setProxyStage('spatial-filter-start');
     [$filteredDocument, $statistics] = filterGeoJsonByBuffers(
         $sourceDocument,
-        $bufferDocument
+        $bufferDocument,
+        $config['transport_mode_property'],
+        $config['allowed_transport_mode_types']
     );
 
     setProxyStage('spatial-filter-complete', $statistics);
@@ -487,6 +531,9 @@ function fetchAndPrepare(array $config): string
     $summary = [
         'retained_features' => $statistics['retained_features'],
         'source_features' => $statistics['source_features'],
+        'transport_mode_filter_enabled' => $statistics['transport_mode_filter_enabled'],
+        'transport_mode_matched_features' => $statistics['transport_mode_matched_features'],
+        'transport_mode_rejected_features' => $statistics['transport_mode_rejected_features'],
         'buffer_polygons' => $statistics['buffer_polygons'],
         'result_bytes' => strlen($body),
         'duration_seconds' => round(microtime(true) - $startedAt, 3),
@@ -891,7 +938,14 @@ function makeCacheKey(array $config): string
 {
     return hash(
         'sha256',
-        VERSION . "\n" . $config['source_url'] . "\n" . $config['buffer_url']
+        VERSION
+        . "\n" . $config['source_url']
+        . "\n" . $config['buffer_url']
+        . "\n" . $config['transport_mode_property']
+        . "\n" . json_encode(
+            $config['allowed_transport_mode_types'],
+            JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+        )
     );
 }
 
@@ -1260,8 +1314,12 @@ function serveStatus(array $config): void
  *     }
  * }
  */
-function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
-{
+function filterGeoJsonByBuffers(
+    array $source,
+    array $bufferDocument,
+    string $transportModeProperty,
+    array $allowedTransportModeTypes
+): array {
     if (($source['type'] ?? null) !== 'FeatureCollection') {
         throw new RuntimeException('source GeoJSON must be a FeatureCollection');
     }
@@ -1271,6 +1329,17 @@ function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
     if (!is_array($sourceFeatures)) {
         throw new RuntimeException('source FeatureCollection has no valid features array');
     }
+
+    $allowedTransportModeLookup = createStringLookup($allowedTransportModeTypes);
+    $transportModeFilterEnabled = $allowedTransportModeLookup !== [];
+
+    proxyLog('INFO', 'transport-mode filter configured', [
+        'enabled' => $transportModeFilterEnabled,
+        'property' => $transportModeProperty,
+        'allowed_values' => $allowedTransportModeTypes,
+        'match_semantics' => 'any',
+        'case_sensitive' => true,
+    ]);
 
     setProxyStage('preparing-buffer-polygons');
     $buffers = prepareBufferPolygons($bufferDocument);
@@ -1297,29 +1366,47 @@ function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
 
     $retained = [];
     $totalFeatures = count($sourceFeatures);
+    $transportModeMatchedFeatures = 0;
+    $transportModeRejectedFeatures = 0;
+    $featuresWithoutValidGeometry = 0;
+    $spatiallyRejectedFeatures = 0;
     $progressEvery = max(0, (int) ($GLOBALS['proxy_diagnostics']['progress_every'] ?? 0));
 
     setProxyStage('filtering', [
         'processed_features' => 0,
         'total_features' => $totalFeatures,
         'retained_features' => 0,
+        'transport_mode_filter_enabled' => $transportModeFilterEnabled,
+        'transport_mode_matched_features' => 0,
+        'transport_mode_rejected_features' => 0,
         'buffer_polygons' => count($buffers),
         'buffer_segments' => $bufferSegmentCount,
     ]);
 
     foreach ($sourceFeatures as $featureIndex => $feature) {
         if (!is_array($feature)) {
+            $transportModeRejectedFeatures++;
             continue;
         }
 
-        $geometry = $feature['geometry'] ?? null;
+        if (!featureMatchesAllowedTransportModes(
+            $feature,
+            $transportModeProperty,
+            $allowedTransportModeLookup
+        )) {
+            $transportModeRejectedFeatures++;
+        } else {
+            $transportModeMatchedFeatures++;
 
-        if (!is_array($geometry)) {
-            continue;
-        }
+            $geometry = $feature['geometry'] ?? null;
 
-        if (geometryIntersectsAnyBuffer($geometry, $buffers)) {
-            $retained[] = $feature;
+            if (!is_array($geometry)) {
+                $featuresWithoutValidGeometry++;
+            } elseif (geometryIntersectsAnyBuffer($geometry, $buffers)) {
+                $retained[] = $feature;
+            } else {
+                $spatiallyRejectedFeatures++;
+            }
         }
 
         $processed = $featureIndex + 1;
@@ -1331,13 +1418,18 @@ function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
                 'processed_features' => $processed,
                 'total_features' => $totalFeatures,
                 'retained_features' => count($retained),
+                'transport_mode_filter_enabled' => $transportModeFilterEnabled,
+                'transport_mode_matched_features' => $transportModeMatchedFeatures,
+                'transport_mode_rejected_features' => $transportModeRejectedFeatures,
+                'features_without_valid_geometry' => $featuresWithoutValidGeometry,
+                'spatially_rejected_features' => $spatiallyRejectedFeatures,
                 'buffer_polygons' => count($buffers),
                 'buffer_segments' => $bufferSegmentCount,
                 'percent' => $totalFeatures > 0
                     ? round($processed * 100 / $totalFeatures, 1)
                     : 100.0,
             ];
-            proxyLog('INFO', 'spatial filter progress', $progress);
+            proxyLog('INFO', 'spatial and attribute filter progress', $progress);
             writeProxyStatus('filtering', $progress);
         }
     }
@@ -1353,10 +1445,119 @@ function filterGeoJsonByBuffers(array $source, array $bufferDocument): array
         [
             'source_features' => count($sourceFeatures),
             'retained_features' => count($retained),
+            'transport_mode_filter_enabled' => $transportModeFilterEnabled,
+            'transport_mode_property' => $transportModeProperty,
+            'allowed_transport_mode_types' => $allowedTransportModeTypes,
+            'transport_mode_matched_features' => $transportModeMatchedFeatures,
+            'transport_mode_rejected_features' => $transportModeRejectedFeatures,
+            'features_without_valid_geometry' => $featuresWithoutValidGeometry,
+            'spatially_rejected_features' => $spatiallyRejectedFeatures,
             'buffer_polygons' => count($buffers),
             'buffer_segments' => $bufferSegmentCount,
         ],
     ];
+}
+
+/**
+ * Normalizes the configured transport-mode list once during startup.
+ *
+ * Empty strings are rejected. Duplicate values are removed and the result is
+ * sorted so a semantically identical configuration produces the same cache key.
+ * Matching against feature values remains exact and case-sensitive.
+ *
+ * @return array<int, string>
+ */
+function normalizeAllowedTransportModeTypes(array $values): array
+{
+    $normalized = [];
+
+    foreach ($values as $index => $value) {
+        if (!is_string($value)) {
+            throw new RuntimeException(sprintf(
+                'ALLOWED_TRANSPORT_MODE_TYPES entry %s must be a string',
+                (string) $index
+            ));
+        }
+
+        $value = trim($value);
+
+        if ($value === '') {
+            throw new RuntimeException(sprintf(
+                'ALLOWED_TRANSPORT_MODE_TYPES entry %s must not be empty',
+                (string) $index
+            ));
+        }
+
+        $normalized[$value] = true;
+    }
+
+    $result = array_keys($normalized);
+    sort($result, SORT_STRING);
+
+    return $result;
+}
+
+/**
+ * @param array<int, string> $values
+ * @return array<string, true>
+ */
+function createStringLookup(array $values): array
+{
+    $lookup = [];
+
+    foreach ($values as $value) {
+        $lookup[$value] = true;
+    }
+
+    return $lookup;
+}
+
+/**
+ * Returns true when the attribute filter is disabled or when at least one
+ * feature value occurs in the configured allow-list.
+ *
+ * The expected GeoJSON shape is:
+ *
+ *   properties[TRANSPORT_MODE_PROPERTY] = ['bus', 'tram', ...]
+ *
+ * A single string is accepted as a convenience, but an array of strings is
+ * the intended representation. Missing, null, or non-string values do not
+ * match when the filter is enabled.
+ *
+ * @param array<string, true> $allowedLookup
+ */
+function featureMatchesAllowedTransportModes(
+    array $feature,
+    string $propertyName,
+    array $allowedLookup
+): bool {
+    if ($allowedLookup === []) {
+        return true;
+    }
+
+    $properties = $feature['properties'] ?? null;
+
+    if (!is_array($properties) || !array_key_exists($propertyName, $properties)) {
+        return false;
+    }
+
+    $featureValues = $properties[$propertyName];
+
+    if (is_string($featureValues)) {
+        return isset($allowedLookup[trim($featureValues)]);
+    }
+
+    if (!is_array($featureValues)) {
+        return false;
+    }
+
+    foreach ($featureValues as $featureValue) {
+        if (is_string($featureValue) && isset($allowedLookup[trim($featureValue)])) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 /**
