@@ -1017,10 +1017,14 @@ def run_tests(args: argparse.Namespace) -> None:
                 "could not fetch and filter valid GeoJSON",
                 "invalid buffer error message",
             )
-            assert_contains(
-                "no valid Polygon or MultiPolygon",
-                invalid_error.get("details", ""),
-                "invalid buffer details",
+            invalid_details = str(invalid_error.get("details", ""))
+            assert_true(
+                re.search(
+                    r"\bcontains no (?:valid )?Polygon or MultiPolygon geometry\b",
+                    invalid_details,
+                )
+                is not None,
+                f"invalid buffer details: unexpected message {invalid_details!r}",
             )
             assert_eq(
                 MockState.counts(),

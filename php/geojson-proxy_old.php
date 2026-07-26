@@ -22,17 +22,7 @@ declare(strict_types=1);
 |
 */
 
-const VERSION = '1.5.1';
-
-/**
- * Canonical API response when no feature survives the filters.
- *
- * A bare JSON array (`[]`) is not a GeoJSON document. uMap expects the
- * top-level object to remain a FeatureCollection even when it has no
- * features.
- */
-const EMPTY_FEATURE_COLLECTION_JSON =
-    '{"type":"FeatureCollection","features":[]}';
+const VERSION = '1.5.0';
 
 /**
  * Main source dataset containing all features.
@@ -646,7 +636,10 @@ function fetchAndPrepare(array $config): array
 
     try {
         setProxyStage('encoding-full-result', $statistics);
-        $body = encodeFeatureCollectionForApi($sourceDocument);
+        $body = json_encode(
+            $sourceDocument,
+            JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+        );
 
         if (strlen($body) > $config['max_bytes']) {
             throw new RuntimeException('filtered result exceeds MAX_BYTES');
@@ -659,7 +652,10 @@ function fetchAndPrepare(array $config): array
             array_merge($statistics, $pointStatistics)
         );
 
-        $pointBody = encodeFeatureCollectionForApi($sourceDocument);
+        $pointBody = json_encode(
+            $sourceDocument,
+            JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
+        );
     } catch (JsonException $e) {
         throw new RuntimeException(
             'could not encode filtered GeoJSON: ' . $e->getMessage(),
@@ -695,38 +691,6 @@ function fetchAndPrepare(array $config): array
         'full' => $body,
         'point' => $pointBody,
     ];
-}
-
-/**
- * Encodes a complete GeoJSON FeatureCollection for the public API.
- *
- * The empty case deliberately uses one canonical object instead of encoding
- * a feature list on its own. Besides being valid GeoJSON, this is accepted by
- * clients such as uMap and avoids retaining irrelevant collection metadata in
- * a no-result response.
- */
-function encodeFeatureCollectionForApi(array &$document): string
-{
-    if (($document['type'] ?? null) !== 'FeatureCollection') {
-        throw new RuntimeException(
-            'API result must be a GeoJSON FeatureCollection'
-        );
-    }
-
-    if (!is_array($document['features'] ?? null)) {
-        throw new RuntimeException(
-            'API result FeatureCollection has no valid features array'
-        );
-    }
-
-    if ($document['features'] === []) {
-        return EMPTY_FEATURE_COLLECTION_JSON;
-    }
-
-    return json_encode(
-        $document,
-        JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES
-    );
 }
 
 /**
