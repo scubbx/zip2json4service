@@ -562,7 +562,7 @@ def create_configured_php_copy(
     replacements = {
         "SOURCE_URL": php_string(source_url),
         "BUFFER_URL": php_string(buffer_url),
-        "CACHE_DIR": php_string(str(cache_dir)),
+        "CACHE_DIR": php_string(str(cache_dir.resolve())),
         "CACHE_TTL": php_string("1s"),
         "STALE_TTL": php_string("20s"),
         "MAX_BYTES": str(10 * 1024 * 1024),
