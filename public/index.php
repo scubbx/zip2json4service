@@ -6,8 +6,10 @@ declare(strict_types=1);
  * uMap GeoJSON spatial filter proxy - Public Entry Point
  */
 
-// Load configuration and constants
+// Load configuration constants first
 require_once __DIR__ . '/../config/config.php';
+
+// Then load dependencies and autoloader
 require_once __DIR__ . '/../config/dependencies.php';
 
 use GeoJsonProxy\Config;
