@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Integration tests for the pure-PHP uMap GeoJSON spatial filter proxy.
 
-The current PHP proxy keeps its configuration in constants at the top of the
-file. This test therefore creates a temporary copy of the PHP script and
-patches only those constants. The original PHP file is never modified.
+The refactored PHP proxy uses a modular structure with configuration in config/config.php.
+This test creates a temporary copy of the entire project structure and patches the
+configuration constants in config/config.php. The original files are never modified.
 
 Covered behavior:
 
@@ -540,14 +540,23 @@ def replace_php_constant(source: str, name: str, php_value: str) -> str:
 
 
 def create_configured_php_copy(
-    original_script: Path,
-    target_script: Path,
+    project_dir: Path,
+    target_dir: Path,
     source_url: str,
     buffer_url: str,
     cache_dir: Path,
     allowed_transport_mode_types: list[str] | None = None,
-) -> None:
-    source = original_script.read_text(encoding="utf-8")
+) -> Path:
+    """Copy the entire project structure and patch config constants."""
+    # Copy the entire project structure
+    shutil.copytree(project_dir, target_dir, dirs_exist_ok=True)
+    
+    # Patch the config file
+    config_file = target_dir / "config" / "config.php"
+    if not config_file.exists():
+        raise RuntimeError(f"Config file not found: {config_file}")
+    
+    source = config_file.read_text(encoding="utf-8")
 
     replacements = {
         "SOURCE_URL": php_string(source_url),
@@ -565,7 +574,10 @@ def create_configured_php_copy(
     for name, value in replacements.items():
         source = replace_php_constant(source, name, value)
 
-    target_script.write_text(source, encoding="utf-8")
+    config_file.write_text(source, encoding="utf-8")
+    
+    # Return the entry point path
+    return target_dir / "public" / "index.php"
 
 
 def lint_php_script(php_bin: str, php_script: Path) -> None:
@@ -654,10 +666,10 @@ def clear_cache(cache_dir: Path) -> None:
 
 
 def run_tests(args: argparse.Namespace) -> None:
-    original_php_script = Path(args.php_script).resolve()
+    project_dir = Path(args.project_dir).resolve()
 
-    if not original_php_script.is_file():
-        raise RuntimeError(f"PHP script not found: {original_php_script}")
+    if not project_dir.is_dir():
+        raise RuntimeError(f"Project directory not found: {project_dir}")
 
     php_bin = shutil.which(args.php_bin)
     if php_bin is None:
@@ -674,20 +686,17 @@ def run_tests(args: argparse.Namespace) -> None:
         with tempfile.TemporaryDirectory(prefix="geojson-spatial-proxy-test-") as tmp:
             tmp_dir = Path(tmp)
             php_dir = tmp_dir / "php"
-            php_dir.mkdir()
             cache_dir = tmp_dir / "cache"
-            configured_php_script = php_dir / original_php_script.name
 
-            create_configured_php_copy(
-                original_script=original_php_script,
-                target_script=configured_php_script,
+            print("Test 0: configured PHP copy passes syntax check")
+            configured_script = create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=php_dir,
                 source_url=f"http://127.0.0.1:{mock_port}/source",
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
                 cache_dir=cache_dir,
             )
-
-            print("Test 0: configured PHP copy passes syntax check")
-            lint_php_script(php_bin, configured_php_script)
+            lint_php_script(php_bin, configured_script)
 
             php_process = start_php_server(
                 php_bin=php_bin,
@@ -695,7 +704,7 @@ def run_tests(args: argparse.Namespace) -> None:
                 php_port=php_port,
             )
 
-            proxy_url = f"http://127.0.0.1:{php_port}/{configured_php_script.name}"
+            proxy_url = f"http://127.0.0.1:{php_port}/index.php"
             point_url = proxy_url + "?geometry=point"
 
             print("Test 1: first GET fetches both gzip files and spatially filters all supported geometry types")
@@ -980,7 +989,7 @@ def run_tests(args: argparse.Namespace) -> None:
 
             before_warm_counts = MockState.counts()
             warm_result = subprocess.run(
-                [php_bin, str(configured_php_script), "--warm-cache"],
+                [php_bin, str(configured_script), "--warm-cache"],
                 cwd=str(php_dir),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -1043,25 +1052,23 @@ def run_tests(args: argparse.Namespace) -> None:
             transport_php_dir = tmp_dir / "php-transport"
             transport_php_dir.mkdir()
             transport_cache_dir = tmp_dir / "cache-transport"
-            transport_php_script = transport_php_dir / original_php_script.name
-            transport_php_port = get_free_port()
-
-            create_configured_php_copy(
-                original_script=original_php_script,
-                target_script=transport_php_script,
+            transport_php_script = create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=transport_php_dir,
                 source_url=f"http://127.0.0.1:{mock_port}/source",
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
                 cache_dir=transport_cache_dir,
                 allowed_transport_mode_types=["bus", "train"],
             )
             lint_php_script(php_bin, transport_php_script)
+            transport_php_port = get_free_port()
             php_process = start_php_server(
                 php_bin=php_bin,
                 php_dir=transport_php_dir,
                 php_port=transport_php_port,
             )
             transport_proxy_url = (
-                f"http://127.0.0.1:{transport_php_port}/{transport_php_script.name}"
+                f"http://127.0.0.1:{transport_php_port}/index.php"
             )
 
             status, headers, transport_body = http_request(
@@ -1102,18 +1109,21 @@ def run_tests(args: argparse.Namespace) -> None:
             php_output += stop_process(php_process)
             php_process = None
 
-            create_configured_php_copy(
-                original_script=original_php_script,
-                target_script=transport_php_script,
+            transport_php_dir2 = tmp_dir / "php-transport2"
+            transport_php_dir2.mkdir()
+            transport_cache_dir2 = tmp_dir / "cache-transport2"
+            transport_php_script2 = create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=transport_php_dir2,
                 source_url=f"http://127.0.0.1:{mock_port}/source",
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
-                cache_dir=transport_cache_dir,
+                cache_dir=transport_cache_dir2,
                 allowed_transport_mode_types=["tram"],
             )
-            lint_php_script(php_bin, transport_php_script)
+            lint_php_script(php_bin, transport_php_script2)
             php_process = start_php_server(
                 php_bin=php_bin,
-                php_dir=transport_php_dir,
+                php_dir=transport_php_dir2,
                 php_port=transport_php_port,
             )
 
@@ -1161,8 +1171,8 @@ def main() -> None:
         description="Integration test for the PHP uMap GeoJSON spatial filter proxy"
     )
     parser.add_argument(
-        "php_script",
-        help="Path to the spatial-filter PHP proxy",
+        "project_dir",
+        help="Path to the project directory containing the PHP proxy",
     )
     parser.add_argument(
         "--php-bin",
