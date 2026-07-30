@@ -68,24 +68,24 @@ final class Config
 
     private function loadDefaultConfig(): array
     {
-        // Constants should be defined by config/config.php which is loaded before this class
+        // Load constants from global namespace (defined in config/config.php)
         return [
-            'version' => VERSION,
-            'source_url' => SOURCE_URL,
-            'buffer_url' => BUFFER_URL,
-            'transport_mode_property' => TRANSPORT_MODE_PROPERTY,
-            'allowed_transport_mode_types' => $this->normalizeAllowedTransportModeTypes(ALLOWED_TRANSPORT_MODE_TYPES),
-            'cache_dir' => CACHE_DIR,
-            'cache_ttl' => $this->parseDuration(CACHE_TTL),
-            'stale_ttl' => $this->parseDuration(STALE_TTL),
-            'max_bytes' => MAX_BYTES,
-            'http_timeout' => HTTP_TIMEOUT,
-            'user_agent' => USER_AGENT,
-            'debug_log_enabled' => DEBUG_LOG_ENABLED,
-            'log_file' => CACHE_DIR . '/' . DEBUG_LOG_FILENAME,
-            'status_file' => CACHE_DIR . '/' . STATUS_FILENAME,
-            'status_endpoint_enabled' => STATUS_ENDPOINT_ENABLED,
-            'log_progress_every' => LOG_PROGRESS_EVERY,
+            'version' => \VERSION,
+            'source_url' => \SOURCE_URL,
+            'buffer_url' => \BUFFER_URL,
+            'transport_mode_property' => \TRANSPORT_MODE_PROPERTY,
+            'allowed_transport_mode_types' => $this->normalizeAllowedTransportModeTypes(\ALLOWED_TRANSPORT_MODE_TYPES),
+            'cache_dir' => \CACHE_DIR,
+            'cache_ttl' => $this->parseDuration(\CACHE_TTL),
+            'stale_ttl' => $this->parseDuration(\STALE_TTL),
+            'max_bytes' => \MAX_BYTES,
+            'http_timeout' => \HTTP_TIMEOUT,
+            'user_agent' => \USER_AGENT,
+            'debug_log_enabled' => \DEBUG_LOG_ENABLED,
+            'log_file' => \CACHE_DIR . '/' . \DEBUG_LOG_FILENAME,
+            'status_file' => \CACHE_DIR . '/' . \STATUS_FILENAME,
+            'status_endpoint_enabled' => \STATUS_ENDPOINT_ENABLED,
+            'log_progress_every' => \LOG_PROGRESS_EVERY,
         ];
     }
 
