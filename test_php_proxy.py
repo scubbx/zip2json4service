@@ -538,6 +538,9 @@ def replace_php_constant(source: str, name: str, php_value: str) -> str:
         raise RuntimeError(f"Could not find exactly one PHP constant named {name}")
 
     return updated
+
+
+def create_configured_php_copy(
     project_dir: Path,
     target_dir: Path,
     source_url: str,
