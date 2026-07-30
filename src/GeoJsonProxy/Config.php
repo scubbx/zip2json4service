@@ -68,26 +68,25 @@ final class Config
 
     private function loadDefaultConfig(): array
     {
-        // Load constants from config file
-        require_once __DIR__ . '/../../config/config.php';
-
+        // Use constants that should already be defined by config/config.php
+        // If not defined, we'll define them with defaults
         return [
-            'version' => VERSION,
-            'source_url' => SOURCE_URL,
-            'buffer_url' => BUFFER_URL,
-            'transport_mode_property' => TRANSPORT_MODE_PROPERTY,
-            'allowed_transport_mode_types' => $this->normalizeAllowedTransportModeTypes(ALLOWED_TRANSPORT_MODE_TYPES),
-            'cache_dir' => CACHE_DIR,
-            'cache_ttl' => $this->parseDuration(CACHE_TTL),
-            'stale_ttl' => $this->parseDuration(STALE_TTL),
-            'max_bytes' => MAX_BYTES,
-            'http_timeout' => HTTP_TIMEOUT,
-            'user_agent' => USER_AGENT,
-            'debug_log_enabled' => DEBUG_LOG_ENABLED,
-            'log_file' => CACHE_DIR . '/' . DEBUG_LOG_FILENAME,
-            'status_file' => CACHE_DIR . '/' . STATUS_FILENAME,
-            'status_endpoint_enabled' => STATUS_ENDPOINT_ENABLED,
-            'log_progress_every' => LOG_PROGRESS_EVERY,
+            'version' => VERSION ?? '1.5.1',
+            'source_url' => SOURCE_URL ?? 'https://example.org/source.geojson.gz',
+            'buffer_url' => BUFFER_URL ?? 'https://example.org/buffer.geojson.gz',
+            'transport_mode_property' => TRANSPORT_MODE_PROPERTY ?? 'affected-transportmode-types',
+            'allowed_transport_mode_types' => $this->normalizeAllowedTransportModeTypes(ALLOWED_TRANSPORT_MODE_TYPES ?? []),
+            'cache_dir' => CACHE_DIR ?? __DIR__ . '/../../cache',
+            'cache_ttl' => $this->parseDuration(CACHE_TTL ?? '15m'),
+            'stale_ttl' => $this->parseDuration(STALE_TTL ?? '24h'),
+            'max_bytes' => MAX_BYTES ?? 32 * 1024 * 1024,
+            'http_timeout' => HTTP_TIMEOUT ?? 60,
+            'user_agent' => USER_AGENT ?? 'umap-geojson-spatial-filter/1.5.1',
+            'debug_log_enabled' => DEBUG_LOG_ENABLED ?? true,
+            'log_file' => (CACHE_DIR ?? __DIR__ . '/../../cache') . '/' . (DEBUG_LOG_FILENAME ?? 'proxy.log'),
+            'status_file' => (CACHE_DIR ?? __DIR__ . '/../../cache') . '/' . (STATUS_FILENAME ?? 'status.json'),
+            'status_endpoint_enabled' => STATUS_ENDPOINT_ENABLED ?? true,
+            'log_progress_every' => LOG_PROGRESS_EVERY ?? 1000,
         ];
     }
 

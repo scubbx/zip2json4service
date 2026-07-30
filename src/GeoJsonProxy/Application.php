@@ -17,9 +17,6 @@ use GeoJsonProxy\GeoJson\BoundingBox;
 use GeoJsonProxy\GeoJson\SpatialFilter;
 use GeoJsonProxy\Diagnostics\Logger;
 
-// Load constants
-require_once __DIR__ . '/Constants.php';
-
 /**
  * Main application class for GeoJSON proxy
  */
