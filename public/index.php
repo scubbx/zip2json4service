@@ -6,7 +6,7 @@ declare(strict_types=1);
  * uMap GeoJSON spatial filter proxy - Public Entry Point
  */
 
-// Load configuration constants first
+// Load configuration constants first (this defines constants in global namespace)
 require_once __DIR__ . '/../config/config.php';
 
 // Then load dependencies and autoloader
@@ -16,6 +16,11 @@ use GeoJsonProxy\Config;
 use GeoJsonProxy\Application;
 
 try {
+    // Verify that constants are loaded
+    if (!defined('\VERSION')) {
+        throw new RuntimeException('Configuration constants not loaded. Please check config/config.php');
+    }
+
     $config = new Config();
 
     if (PHP_SAPI === 'cli') {
