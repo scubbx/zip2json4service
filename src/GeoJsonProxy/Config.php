@@ -69,23 +69,24 @@ final class Config
     private function loadDefaultConfig(): array
     {
         // Load constants from global namespace (defined in config/config.php)
+        // Use global keyword to access global constants from within namespace
         return [
-            'version' => \VERSION,
-            'source_url' => \SOURCE_URL,
-            'buffer_url' => \BUFFER_URL,
-            'transport_mode_property' => \TRANSPORT_MODE_PROPERTY,
-            'allowed_transport_mode_types' => $this->normalizeAllowedTransportModeTypes(\ALLOWED_TRANSPORT_MODE_TYPES),
-            'cache_dir' => \CACHE_DIR,
-            'cache_ttl' => $this->parseDuration(\CACHE_TTL),
-            'stale_ttl' => $this->parseDuration(\STALE_TTL),
-            'max_bytes' => \MAX_BYTES,
-            'http_timeout' => \HTTP_TIMEOUT,
-            'user_agent' => \USER_AGENT,
-            'debug_log_enabled' => \DEBUG_LOG_ENABLED,
-            'log_file' => \CACHE_DIR . '/' . \DEBUG_LOG_FILENAME,
-            'status_file' => \CACHE_DIR . '/' . \STATUS_FILENAME,
-            'status_endpoint_enabled' => \STATUS_ENDPOINT_ENABLED,
-            'log_progress_every' => \LOG_PROGRESS_EVERY,
+            'version' => $GLOBALS['VERSION'] ?? (defined('\VERSION') ? \VERSION : '1.5.1'),
+            'source_url' => $GLOBALS['SOURCE_URL'] ?? (defined('\SOURCE_URL') ? \SOURCE_URL : 'https://example.org/source.geojson.gz'),
+            'buffer_url' => $GLOBALS['BUFFER_URL'] ?? (defined('\BUFFER_URL') ? \BUFFER_URL : 'https://example.org/buffer.geojson.gz'),
+            'transport_mode_property' => $GLOBALS['TRANSPORT_MODE_PROPERTY'] ?? (defined('\TRANSPORT_MODE_PROPERTY') ? \TRANSPORT_MODE_PROPERTY : 'affected-transportmode-types'),
+            'allowed_transport_mode_types' => $this->normalizeAllowedTransportModeTypes($GLOBALS['ALLOWED_TRANSPORT_MODE_TYPES'] ?? (defined('\ALLOWED_TRANSPORT_MODE_TYPES') ? \ALLOWED_TRANSPORT_MODE_TYPES : [])),
+            'cache_dir' => $GLOBALS['CACHE_DIR'] ?? (defined('\CACHE_DIR') ? \CACHE_DIR : __DIR__ . '/../../cache'),
+            'cache_ttl' => $this->parseDuration($GLOBALS['CACHE_TTL'] ?? (defined('\CACHE_TTL') ? \CACHE_TTL : '15m')),
+            'stale_ttl' => $this->parseDuration($GLOBALS['STALE_TTL'] ?? (defined('\STALE_TTL') ? \STALE_TTL : '24h')),
+            'max_bytes' => $GLOBALS['MAX_BYTES'] ?? (defined('\MAX_BYTES') ? \MAX_BYTES : 32 * 1024 * 1024),
+            'http_timeout' => $GLOBALS['HTTP_TIMEOUT'] ?? (defined('\HTTP_TIMEOUT') ? \HTTP_TIMEOUT : 60),
+            'user_agent' => $GLOBALS['USER_AGENT'] ?? (defined('\USER_AGENT') ? \USER_AGENT : 'umap-geojson-spatial-filter/1.5.1'),
+            'debug_log_enabled' => $GLOBALS['DEBUG_LOG_ENABLED'] ?? (defined('\DEBUG_LOG_ENABLED') ? \DEBUG_LOG_ENABLED : true),
+            'log_file' => ($GLOBALS['CACHE_DIR'] ?? (defined('\CACHE_DIR') ? \CACHE_DIR : __DIR__ . '/../../cache')) . '/' . ($GLOBALS['DEBUG_LOG_FILENAME'] ?? (defined('\DEBUG_LOG_FILENAME') ? \DEBUG_LOG_FILENAME : 'proxy.log')),
+            'status_file' => ($GLOBALS['CACHE_DIR'] ?? (defined('\CACHE_DIR') ? \CACHE_DIR : __DIR__ . '/../../cache')) . '/' . ($GLOBALS['STATUS_FILENAME'] ?? (defined('\STATUS_FILENAME') ? \STATUS_FILENAME : 'status.json')),
+            'status_endpoint_enabled' => $GLOBALS['STATUS_ENDPOINT_ENABLED'] ?? (defined('\STATUS_ENDPOINT_ENABLED') ? \STATUS_ENDPOINT_ENABLED : true),
+            'log_progress_every' => $GLOBALS['LOG_PROGRESS_EVERY'] ?? (defined('\LOG_PROGRESS_EVERY') ? \LOG_PROGRESS_EVERY : 1000),
         ];
     }
 

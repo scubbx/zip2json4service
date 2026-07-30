@@ -16,9 +16,17 @@ use GeoJsonProxy\Config;
 use GeoJsonProxy\Application;
 
 try {
-    // Verify that constants are loaded
-    if (!defined('\VERSION')) {
-        throw new RuntimeException('Configuration constants not loaded. Please check config/config.php');
+    // Debug: Check if constants are defined
+    $missing_constants = [];
+    $required_constants = ['VERSION', 'SOURCE_URL', 'BUFFER_URL', 'CACHE_DIR', 'CACHE_TTL'];
+    foreach ($required_constants as $const) {
+        if (!defined($const)) {
+            $missing_constants[] = $const;
+        }
+    }
+    
+    if (!empty($missing_constants)) {
+        throw new RuntimeException('Missing configuration constants: ' . implode(', ', $missing_constants));
     }
 
     $config = new Config();
@@ -47,10 +55,18 @@ try {
         http_response_code(500);
     }
 
-    echo json_encode([
+    // Include file and line in error response
+    $error_response = [
         'error' => 'internal proxy error',
         'details' => $e->getMessage(),
         'file' => $e->getFile(),
         'line' => $e->getLine(),
-    ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    ];
+    
+    // Add trace for debugging
+    if (getenv('DEBUG') === '1') {
+        $error_response['trace'] = $e->getTraceAsString();
+    }
+    
+    echo json_encode($error_response, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
 }
