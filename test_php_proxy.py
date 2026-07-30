@@ -705,7 +705,7 @@ def run_tests(args: argparse.Namespace) -> None:
                 php_port=php_port,
             )
 
-            proxy_url = f"http://127.0.0.1:{php_port}/index.php"
+            proxy_url = f"http://127.0.0.1:{php_port}/public/index.php"
             point_url = proxy_url + "?geometry=point"
 
             print("Test 1: first GET fetches both gzip files and spatially filters all supported geometry types")
@@ -1069,7 +1069,7 @@ def run_tests(args: argparse.Namespace) -> None:
                 php_port=transport_php_port,
             )
             transport_proxy_url = (
-                f"http://127.0.0.1:{transport_php_port}/index.php"
+                f"http://127.0.0.1:{transport_php_port}/public/index.php"
             )
 
             status, headers, transport_body = http_request(
