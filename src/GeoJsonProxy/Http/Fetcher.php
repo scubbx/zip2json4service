@@ -82,8 +82,8 @@ final class Fetcher
             throw new RuntimeException('curl error: ' . $error);
         }
 
-        if ($status < 200 || $status >= 300) {
-            throw new RuntimeException('remote source returned HTTP ' . $status);
+        if ($status !== 200) {
+            throw new RuntimeException('remote source returned HTTP ' . $status . ' (expected 200)');
         }
 
         return $body;
@@ -128,8 +128,8 @@ final class Fetcher
         }
 
         $status = $this->parseHttpStatus($http_response_header ?? []);
-        if ($status !== null && ($status < 200 || $status >= 300)) {
-            throw new RuntimeException('remote source returned HTTP ' . $status);
+        if ($status !== null && $status !== 200) {
+            throw new RuntimeException('remote source returned HTTP ' . $status . ' (expected 200)');
         }
 
         return $body;
