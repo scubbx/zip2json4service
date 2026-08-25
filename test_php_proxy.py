@@ -24,6 +24,8 @@ Covered behavior:
   cache is available;
 * the optional affected-transportmode-types allow-list uses OR semantics,
   rejects missing/non-matching values, and participates in cache invalidation;
+* request-time from/until criteria use configurable properties and parameter
+  names, inclusive interval-overlap semantics, and do not alter the warm cache;
 * malformed upstream payloads, plain JSON, size limits, stale expiry, cache
   corruption, status/CLI behavior, and concurrent refresh locking are covered.
 """
@@ -46,7 +48,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 
 def square(min_x: float, min_y: float, max_x: float, max_y: float) -> list[list[float]]:
@@ -277,6 +279,50 @@ for _feature in SOURCE_GEOJSON["features"]:
         _feature["properties"]["affected-transportmode-types"] = _value
 
 
+TIME_FILTER_FROM = "2025-01-10T00:00:00Z"
+TIME_FILTER_UNTIL = "2025-01-20T00:00:00Z"
+DEFAULT_FEATURE_START = "2025-01-12T00:00:00Z"
+DEFAULT_FEATURE_END = "2025-01-18T00:00:00Z"
+
+TIME_PROPERTY_VALUES: dict[str, tuple[str | None, str | None]] = {
+    # Inclusive lower request boundary: end == from must be retained.
+    "point_inside": ("2025-01-01T00:00:00Z", TIME_FILTER_FROM),
+    "point_outer_boundary": (
+        "2025-01-01T00:00:00Z",
+        "2025-01-09T23:59:59Z",
+    ),
+    # Inclusive upper request boundary: start == until must be retained.
+    "point_hole_boundary": (TIME_FILTER_UNTIL, "2025-01-25T00:00:00Z"),
+    "point_second_buffer": (
+        "2025-01-20T00:00:01Z",
+        "2025-01-25T00:00:00Z",
+    ),
+    "point_third_buffer": (DEFAULT_FEATURE_START, "not-a-timestamp"),
+    "line_crosses": (None, DEFAULT_FEATURE_END),
+    "line_touches_vertex": (DEFAULT_FEATURE_START, None),
+}
+
+for _feature in SOURCE_GEOJSON["features"]:
+    _feature_id = str(_feature.get("id"))
+    _start, _end = TIME_PROPERTY_VALUES.get(
+        _feature_id,
+        (DEFAULT_FEATURE_START, DEFAULT_FEATURE_END),
+    )
+    _properties = _feature["properties"]
+
+    if _start is None:
+        _properties.pop("start-time", None)
+    else:
+        _properties["start-time"] = _start
+        _properties["customStartTime"] = _start
+
+    if _end is None:
+        _properties.pop("stop-time", None)
+    else:
+        _properties["stop-time"] = _end
+        _properties["customEndTime"] = _end
+
+
 EXPECTED_ALLOWED_BUS_TRAIN_IDS = [
     "point_inside",
     "point_second_buffer",
@@ -373,6 +419,36 @@ EXPECTED_INITIAL_IDS = [
     "multiline_hit",
     "multipolygon_hit",
     "geometrycollection_hit",
+]
+
+EXPECTED_TIME_WINDOW_IDS = [
+    feature_id
+    for feature_id in EXPECTED_INITIAL_IDS
+    if feature_id
+    not in {
+        "point_outer_boundary",
+        "point_second_buffer",
+        "point_third_buffer",
+        "line_crosses",
+        "line_touches_vertex",
+    }
+]
+
+EXPECTED_TIME_FROM_IDS = [
+    feature_id
+    for feature_id in EXPECTED_INITIAL_IDS
+    if feature_id
+    not in {
+        "point_outer_boundary",
+        "point_third_buffer",
+        "line_touches_vertex",
+    }
+]
+
+EXPECTED_TIME_UNTIL_IDS = [
+    feature_id
+    for feature_id in EXPECTED_INITIAL_IDS
+    if feature_id not in {"point_second_buffer", "line_crosses"}
 ]
 
 EXPECTED_MOVED_IDS = [
@@ -661,6 +737,10 @@ def create_configured_php_copy(
     buffer_url: str,
     cache_dir: Path,
     allowed_transport_mode_types: list[str] | None = None,
+    time_filter_start_property: str = "start-time",
+    time_filter_end_property: str = "stop-time",
+    time_filter_from_parameter: str = "from",
+    time_filter_until_parameter: str = "until",
     cache_ttl: str = "1s",
     stale_ttl: str = "20s",
     max_bytes: int = 10 * 1024 * 1024,
@@ -688,6 +768,10 @@ def create_configured_php_copy(
         "ALLOWED_TRANSPORT_MODE_TYPES": php_string_array(
             allowed_transport_mode_types or []
         ),
+        "TIME_FILTER_START_PROPERTY": php_string(time_filter_start_property),
+        "TIME_FILTER_END_PROPERTY": php_string(time_filter_end_property),
+        "TIME_FILTER_FROM_PARAMETER": php_string(time_filter_from_parameter),
+        "TIME_FILTER_UNTIL_PARAMETER": php_string(time_filter_until_parameter),
     }
 
     for name, value in replacements.items():
@@ -1048,6 +1132,171 @@ def run_tests(args: argparse.Namespace) -> None:
             assert_eq(status, 304, "point If-None-Match status")
             assert_eq(point_body_304, b"", "point 304 response should have an empty body")
             assert_eq(MockState.counts(), (1, 1), "point 304 should not fetch upstream data")
+
+            print("Test 3b: request time windows filter both representations without changing the warm cache")
+            cached_files_before_time_filter = {
+                path.name: path.read_bytes()
+                for path in (cache_data_path, cache_point_path, cache_meta_path)
+            }
+            time_window_query = urlencode(
+                {"from": TIME_FILTER_FROM, "until": TIME_FILTER_UNTIL}
+            )
+            time_window_url = proxy_url + "?" + time_window_query
+
+            status, time_headers, time_body = http_request("GET", time_window_url)
+            assert_eq(status, 200, "time-window GET status")
+            assert_eq(time_headers.get("x-cache"), "HIT", "time window should use warm cache")
+            assert_eq(MockState.counts(), (1, 1), "time window must not fetch upstream data")
+            assert_eq(
+                retained_ids(json.loads(time_body.decode("utf-8"))),
+                EXPECTED_TIME_WINDOW_IDS,
+                "inclusive overlapping time-window IDs",
+            )
+            assert_true(
+                "point_inside" in retained_ids(json.loads(time_body.decode("utf-8")))
+                and "point_hole_boundary" in retained_ids(json.loads(time_body.decode("utf-8"))),
+                "features exactly on either time boundary must be retained",
+            )
+            time_etag = time_headers.get("etag")
+            assert_true(time_etag and time_etag != etag_initial, "filtered ETag should be content-specific")
+            assert_eq(
+                int(time_headers.get("content-length", "-1")),
+                len(time_body),
+                "time-filtered Content-Length",
+            )
+
+            time_point_url = point_url + "&" + time_window_query
+            status, time_point_headers, time_point_body = http_request(
+                "GET", time_point_url
+            )
+            assert_eq(status, 200, "point time-window GET status")
+            assert_eq(time_point_headers.get("x-cache"), "HIT", "point time window cache status")
+            time_point_document = json.loads(time_point_body.decode("utf-8"))
+            assert_eq(
+                retained_ids(time_point_document),
+                EXPECTED_TIME_WINDOW_IDS,
+                "point time-window IDs",
+            )
+            assert_true(
+                all(
+                    item.get("geometry", {}).get("type") == "Point"
+                    for item in time_point_document["features"]
+                ),
+                "time-filtered point response should retain Point geometries",
+            )
+
+            status, conditional_time_headers, conditional_time_body = http_request(
+                "GET",
+                time_window_url,
+                headers={"If-None-Match": str(time_etag)},
+            )
+            assert_eq(status, 304, "time-window If-None-Match status")
+            assert_eq(conditional_time_body, b"", "time-window 304 body")
+            assert_eq(
+                conditional_time_headers.get("etag"),
+                time_etag,
+                "time-window 304 ETag",
+            )
+
+            status, time_head_headers, time_head_body = http_request(
+                "HEAD", time_window_url
+            )
+            assert_eq(status, 200, "time-window HEAD status")
+            assert_eq(time_head_headers.get("etag"), time_etag, "time-window HEAD ETag")
+            assert_eq(
+                int(time_head_headers.get("content-length", "-1")),
+                len(time_body),
+                "time-window HEAD Content-Length",
+            )
+            assert_eq(time_head_body, b"", "time-window HEAD body")
+
+            status, _, from_body = http_request(
+                "GET", proxy_url + "?" + urlencode({"from": TIME_FILTER_FROM})
+            )
+            assert_eq(status, 200, "from-only time filter status")
+            assert_eq(
+                retained_ids(json.loads(from_body.decode("utf-8"))),
+                EXPECTED_TIME_FROM_IDS,
+                "from-only time filter IDs",
+            )
+
+            status, _, until_body = http_request(
+                "GET", proxy_url + "?" + urlencode({"until": TIME_FILTER_UNTIL})
+            )
+            assert_eq(status, 200, "until-only time filter status")
+            assert_eq(
+                retained_ids(json.loads(until_body.decode("utf-8"))),
+                EXPECTED_TIME_UNTIL_IDS,
+                "until-only time filter IDs",
+            )
+
+            status, _, equivalent_offset_body = http_request(
+                "GET",
+                proxy_url
+                + "?"
+                + urlencode({"from": "2025-01-10T01:00:00+01:00"}),
+            )
+            assert_eq(status, 200, "offset timestamp time filter status")
+            assert_eq(
+                retained_ids(json.loads(equivalent_offset_body.decode("utf-8"))),
+                EXPECTED_TIME_FROM_IDS,
+                "offset timestamp should represent the same instant",
+            )
+
+            status, _, empty_time_body = http_request(
+                "GET",
+                proxy_url
+                + "?"
+                + urlencode({"from": "2100-01-01T00:00:00Z"}),
+            )
+            assert_eq(status, 200, "empty time-filter result status")
+            assert_eq(
+                json.loads(empty_time_body.decode("utf-8")),
+                {"type": "FeatureCollection", "features": []},
+                "empty time-filter FeatureCollection",
+            )
+
+            status, _, unfiltered_after_time_body = http_request("GET", proxy_url)
+            assert_eq(status, 200, "unfiltered GET after time filters")
+            assert_eq(
+                unfiltered_after_time_body,
+                initial_body,
+                "omitted time parameters must preserve the unfiltered cached response",
+            )
+            assert_eq(
+                {
+                    path.name: path.read_bytes()
+                    for path in (cache_data_path, cache_point_path, cache_meta_path)
+                },
+                cached_files_before_time_filter,
+                "request time filters must not rewrite any warm-cache file",
+            )
+
+            print("Test 3c: invalid time criteria fail before cache or upstream processing")
+            invalid_time_urls = [
+                proxy_url + "?from=not-a-date",
+                proxy_url + "?until=",
+                proxy_url + "?from[]=2025-01-10",
+                proxy_url + "?from=2025-02-30",
+                proxy_url
+                + "?"
+                + urlencode(
+                    {
+                        "from": "2025-01-21T00:00:00Z",
+                        "until": "2025-01-20T00:00:00Z",
+                    }
+                ),
+            ]
+            for invalid_time_url in invalid_time_urls:
+                status, _, invalid_time_body = http_request("GET", invalid_time_url)
+                assert_eq(status, 400, "invalid time criterion status")
+                invalid_time_error = json.loads(invalid_time_body.decode("utf-8"))
+                assert_true(
+                    str(invalid_time_error.get("error", "")).startswith("invalid time filter"),
+                    "invalid time criterion error message",
+                )
+
+            assert_eq(MockState.counts(), (1, 1), "invalid time criteria must not fetch upstream")
 
             print("Test 4: HEAD returns filtered representation headers without a body")
             status, headers, head_body = http_request("HEAD", proxy_url)
@@ -1631,6 +1880,66 @@ def run_tests(args: argparse.Namespace) -> None:
                 "changed attribute-filter result should receive a new ETag",
             )
 
+            print("Test 12b: time properties and URL parameter names are configurable")
+            php_output += stop_process(php_process)
+            php_process = None
+            MockState.reset()
+
+            custom_time_php_dir = tmp_dir / "php-custom-time"
+            custom_time_cache_dir = tmp_dir / "cache-custom-time"
+            create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=custom_time_php_dir,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=custom_time_cache_dir,
+                time_filter_start_property="customStartTime",
+                time_filter_end_property="customEndTime",
+                time_filter_from_parameter="von",
+                time_filter_until_parameter="bis",
+                cache_ttl="30s",
+            )
+            custom_time_php_port = get_free_port()
+            php_process = start_php_server(
+                php_bin=php_bin,
+                php_dir=custom_time_php_dir,
+                php_port=custom_time_php_port,
+            )
+            custom_time_proxy_url = (
+                f"http://127.0.0.1:{custom_time_php_port}/public/index.php"
+            )
+
+            status, custom_time_headers, custom_time_body = http_request(
+                "GET",
+                custom_time_proxy_url
+                + "?"
+                + urlencode({"von": TIME_FILTER_FROM, "bis": TIME_FILTER_UNTIL}),
+            )
+            assert_eq(status, 200, "custom time-filter configuration status")
+            assert_eq(
+                custom_time_headers.get("x-cache"),
+                "MISS",
+                "custom time-filter first request cache status",
+            )
+            assert_eq(
+                retained_ids(json.loads(custom_time_body.decode("utf-8"))),
+                EXPECTED_TIME_WINDOW_IDS,
+                "custom time properties and parameters output",
+            )
+            assert_eq(MockState.counts(), (1, 1), "custom time filter upstream counts")
+
+            status, custom_unfiltered_headers, custom_unfiltered_body = http_request(
+                "GET", custom_time_proxy_url + "?from=not-the-configured-parameter"
+            )
+            assert_eq(status, 200, "unconfigured time parameter status")
+            assert_eq(custom_unfiltered_headers.get("x-cache"), "HIT", "custom config cache reuse")
+            assert_eq(
+                retained_ids(json.loads(custom_unfiltered_body.decode("utf-8"))),
+                EXPECTED_INITIAL_IDS,
+                "only the configured time parameter names should activate filtering",
+            )
+            assert_eq(MockState.counts(), (1, 1), "custom time variants should reuse cache")
+
             print("Test 13: redirects are followed and compressed/download size limits are enforced")
             php_output += stop_process(php_process)
             php_process = None
@@ -1813,6 +2122,37 @@ def run_tests(args: argparse.Namespace) -> None:
                 "invalid duration",
                 invalid_config_result.stdout,
                 "invalid config diagnostic",
+            )
+
+            invalid_time_config_php_dir = tmp_dir / "php-invalid-time-config"
+            invalid_time_config_script = create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=invalid_time_config_php_dir,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=tmp_dir / "cache-invalid-time-config",
+                time_filter_from_parameter="time",
+                time_filter_until_parameter="time",
+                cache_ttl="30s",
+            )
+            invalid_time_config_result = subprocess.run(
+                [php_bin, str(invalid_time_config_script), "--version"],
+                cwd=str(invalid_time_config_php_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            assert_eq(
+                invalid_time_config_result.returncode,
+                1,
+                "invalid time config exit status",
+            )
+            assert_contains(
+                "must be different",
+                invalid_time_config_result.stdout,
+                "invalid time config diagnostic",
             )
 
             print()

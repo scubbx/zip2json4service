@@ -30,7 +30,8 @@ Der Proxy funktioniert in folgenden Schritten:
 3. **Räumliche Filterung**: Behält nur Features, die mindestens ein Puffer-Polygon schneiden, berühren oder innerhalb liegen
 4. **Punktdarstellung**: Berechnet parallel eine Punktdarstellung (Schwerpunkte) für Symbol-Layer
 5. **Caching**: Speichert die gefilterten Ergebnisse zwischenspeichert für schnelle Auslieferung
-6. **Auslieferung**: Liefert die Ergebnisse als GeoJSON mit CORS-Unterstützung aus
+6. **Zeitfilter**: Filtert auf Wunsch pro URL-Anfrage nach einem überlappenden Gültigkeitszeitraum
+7. **Auslieferung**: Liefert die Ergebnisse als GeoJSON mit CORS-Unterstützung aus
 
 **Wichtig**: Beide GeoJSON-Datensätze müssen dasselbe Koordinatensystem verwenden (typischerweise WGS84 mit [Längengrad, Breitengrad]).
 
@@ -176,6 +177,16 @@ const ALLOWED_TRANSPORT_MODE_TYPES = ['bus', 'tram'];
 // Oder deaktivieren:
 // const ALLOWED_TRANSPORT_MODE_TYPES = [];
 
+// === Optional: Zeitfilter für Web-Anfragen ===
+
+// Properties mit Beginn und Ende des Feature-Gültigkeitszeitraums
+const TIME_FILTER_START_PROPERTY = 'start-time';
+const TIME_FILTER_END_PROPERTY = 'stop-time';
+
+// Namen der URL-Parameter
+const TIME_FILTER_FROM_PARAMETER = 'from';
+const TIME_FILTER_UNTIL_PARAMETER = 'until';
+
 // === Cache-Einstellungen ===
 
 // Cache-Verzeichnis (relativ zum Skript oder absoluter Pfad)
@@ -211,6 +222,7 @@ const STATUS_ENDPOINT_ENABLED = true;
 
 - **SOURCE_URL**: Muss eine gültige GeoJSON FeatureCollection sein
 - **BUFFER_URL**: Muss mindestens ein Polygon oder MultiPolygon enthalten
+- **Zeitfilter**: Ist nur aktiv, wenn `from`, `until` oder die entsprechend umbenannten Parameter in der URL vorkommen
 - **CACHE_DIR**: Muss beschreibbar für den PHP-Prozess sein
 - **MAX_BYTES**: Erhöhen Sie dies, wenn Ihre Daten größer als 32 MB sind
 - **DEBUG_LOG_ENABLED**: Auf `false` setzen, wenn alles funktioniert
@@ -308,6 +320,10 @@ Oder laden Sie `cache/proxy.log` per FTP herunter.
 | `BUFFER_URL` | string | - | **Pflicht**: URL der Puffer-GeoJSON |
 | `TRANSPORT_MODE_PROPERTY` | string | 'affected-transportmode-types' | Property-Name für Verkehrsmittel |
 | `ALLOWED_TRANSPORT_MODE_TYPES` | array | [] | Erlaubte Verkehrsmitteltypen |
+| `TIME_FILTER_START_PROPERTY` | string | 'start-time' | Property mit dem Beginn des Feature-Zeitraums |
+| `TIME_FILTER_END_PROPERTY` | string | 'stop-time' | Property mit dem Ende des Feature-Zeitraums |
+| `TIME_FILTER_FROM_PARAMETER` | string | 'from' | URL-Parameter für die inklusive Untergrenze |
+| `TIME_FILTER_UNTIL_PARAMETER` | string | 'until' | URL-Parameter für die inklusive Obergrenze |
 | `CACHE_DIR` | string | `config/../cache` | Cache-Verzeichnis |
 | `CACHE_TTL` | string | '15m' | Frische Cache-Lebensdauer |
 | `STALE_TTL` | string | '24h' | Veralteter Cache-Lebensdauer |
@@ -352,6 +368,11 @@ const BUFFER_URL = 'https://data.your-city.de/boundaries/city-limits.geojson.gz'
 const TRANSPORT_MODE_PROPERTY = 'affected-transportmode-types';
 const ALLOWED_TRANSPORT_MODE_TYPES = ['bus', 'tram', 'train'];
 
+const TIME_FILTER_START_PROPERTY = 'start-time';
+const TIME_FILTER_END_PROPERTY = 'stop-time';
+const TIME_FILTER_FROM_PARAMETER = 'from';
+const TIME_FILTER_UNTIL_PARAMETER = 'until';
+
 const CACHE_DIR = __DIR__ . '/../cache';
 const CACHE_TTL = '30m';    // 30 Minuten frischer Cache
 const STALE_TTL = '48h';   // 48 Stunden veralteter Cache
@@ -373,7 +394,28 @@ const STATUS_ENDPOINT_ENABLED = true;
 |----------|--------------|----------|
 | Standard | Vollständige gefilterte Geometrien | `https://ihre-domain.de/geojson-proxy/public/index.php` |
 | Punktdarstellung | Schwerpunkte für Symbol-Layer | `https://ihre-domain.de/geojson-proxy/public/index.php?geometry=point` |
+| Zeitfenster | Features mit überlappendem Gültigkeitszeitraum | `https://ihre-domain.de/geojson-proxy/public/index.php?from=2025-01-01&until=2025-01-31` |
 | Status | Diagnose-Informationen | `https://ihre-domain.de/geojson-proxy/public/index.php?status=1` |
+
+#### Zeitfilter
+
+Mit den Standardwerten akzeptiert der Daten-Endpunkt die optionalen Parameter `from` und `until`. Beide erwarten ein ISO-8601-Datum oder einen ISO-8601-Zeitstempel, beispielsweise:
+
+```text
+https://ihre-domain.de/geojson-proxy/public/index.php?from=2025-01-01T00%3A00%3A00Z&until=2025-01-31T23%3A59%3A59Z
+https://ihre-domain.de/geojson-proxy/public/index.php?geometry=point&from=2025-01-01
+```
+
+Die Prüfung erfolgt als Intervall-Überlappung mit inklusiven Grenzen:
+
+- `from`: Das Ende des Features (`stop-time`) muss gleich oder später sein.
+- `until`: Der Beginn des Features (`start-time`) muss gleich oder früher sein.
+- Sind beide Parameter gesetzt, muss der Feature-Zeitraum das angefragte Zeitfenster überlappen.
+- Ist nur einer gesetzt, wird nur die entsprechende Grenze geprüft.
+- Fehlt ein dabei benötigtes Property oder enthält es keinen gültigen Zeitwert, wird das Feature verworfen.
+- Fehlen beide URL-Parameter, findet keine Zeitfilterung statt.
+
+Leere oder ungültige Zeitangaben sowie `from > until` liefern `HTTP 400`. Datumswerte ohne Uhrzeit sowie Zeitstempel ohne Zeitzonenangabe werden als UTC interpretiert. Der Zeitfilter arbeitet auf dem bereits vorbereiteten Cache: Verschiedene Zeitfenster lösen keinen Upstream-Abruf aus und verändern weder den durch `--warm-cache` erzeugten Cache noch seine Dateien. Die Antwort erhält jedoch einen zum gefilterten Inhalt passenden ETag.
 
 **HTTP-Methoden**:
 - `GET` - Daten abrufen
@@ -439,7 +481,7 @@ Der Test prüft unter anderem:
 - die Syntax aller PHP-Dateien in der temporär konfigurierten Projektkopie;
 - gzip-komprimierte und unkomprimierte Upstream-Daten, Redirects, Größenlimits und fehlerhafte Payloads;
 - alle unterstützten GeoJSON-Geometrietypen sowie Löcher, Grenzberührungen und degenerierte Randfälle;
-- vollständige und punktförmige Repräsentationen einschließlich Transportmodusfilter;
+- vollständige und punktförmige Repräsentationen einschließlich Transportmodus- und Zeitfilter;
 - Cache `MISS`, `HIT` und `STALE`, Cache-Key-Invalidierung, beschädigte Cache-Dateien und den Ablauf von `stale_until`;
 - ETags, `304 Not Modified`, `HEAD`, `OPTIONS`, CORS, Status-Endpunkt und CLI-Befehle;
 - konkurrierende Cold-Cache-Anfragen und die Verriegelung des gemeinsamen Refreshs.
@@ -768,7 +810,8 @@ Mögliche Stufen:
 │   │   ├── Point.php         # Punkt-Utilities
 │   │   ├── PreparedPolygon.php # Kompakter Pufferpolygon-Index
 │   │   ├── Segment.php       # Segment-Schnittprüfung
-│   │   └── SpatialFilter.php # Räumliche Filterung
+│   │   ├── SpatialFilter.php # Räumliche Filterung
+│   │   └── TimeWindowFilter.php # Zeitfenster-Filterung
 │   ├── Http/
 │   │   ├── Fetcher.php      # HTTP-Client
 │   │   └── GzipDetector.php # Gzip-Erkennung
@@ -784,6 +827,7 @@ Mögliche Stufen:
 
 - ✅ **Gzip-Unterstützung**: Automatische Erkennung und Dekomprimierung
 - ✅ **Attributfilter**: Filterung nach Verkehrsmitteltypen (optional)
+- ✅ **Zeitfilter**: Konfigurierbare, anfragebezogene Intervallfilterung (optional)
 - ✅ **Räumliche Filterung**: Präzise geometrische Schnittprüfungen
 - ✅ **Caching**: Intelligentes Caching mit TTL und Stale-Cache
 - ✅ **Punktdarstellung**: Automatische Schwerpunktberechnung

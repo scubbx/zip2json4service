@@ -15,6 +15,7 @@ use GeoJsonProxy\GeoJson\GeometryExtractor;
 use GeoJsonProxy\GeoJson\Centroid;
 use GeoJsonProxy\GeoJson\BoundingBox;
 use GeoJsonProxy\GeoJson\SpatialFilter;
+use GeoJsonProxy\GeoJson\TimeWindowFilter;
 use GeoJsonProxy\Diagnostics\Logger;
 
 /**
@@ -25,6 +26,7 @@ final class Application
     private Config $config;
     private CacheManager $cacheManager;
     private Fetcher $fetcher;
+    private ?array $requestTimeWindow = null;
 
     public function __construct(Config $config)
     {
@@ -58,12 +60,17 @@ final class Application
         }
 
         $geometryMode = $this->getRequestedGeometryMode();
+        $this->requestTimeWindow = $this->getRequestedTimeWindow();
 
         Logger::initialize($this->config->toArray(), 'web');
         Logger::setStage('request-start', [
             'method' => $method,
             'request_uri' => $_SERVER['REQUEST_URI'] ?? null,
             'geometry_mode' => $geometryMode,
+            'time_filter' => $this->requestTimeWindow === null ? null : [
+                'from' => $this->requestTimeWindow['from_value'],
+                'until' => $this->requestTimeWindow['until_value'],
+            ],
         ]);
 
         $entry = $this->cacheManager->load();
@@ -546,6 +553,79 @@ final class Application
     }
 
     /**
+     * Get and validate the optional request time window.
+     *
+     * @return array{
+     *   from: int|null,
+     *   until: int|null,
+     *   from_value: string|null,
+     *   until_value: string|null
+     * }|null
+     */
+    private function getRequestedTimeWindow(): ?array
+    {
+        $fromParameter = $this->config->getString('time_filter_from_parameter');
+        $untilParameter = $this->config->getString('time_filter_until_parameter');
+        $fromIsSet = array_key_exists($fromParameter, $_GET);
+        $untilIsSet = array_key_exists($untilParameter, $_GET);
+
+        if (!$fromIsSet && !$untilIsSet) {
+            return null;
+        }
+
+        $window = [
+            'from' => null,
+            'until' => null,
+            'from_value' => null,
+            'until_value' => null,
+        ];
+
+        foreach ([
+            'from' => [$fromParameter, $fromIsSet],
+            'until' => [$untilParameter, $untilIsSet],
+        ] as $criterion => [$parameter, $isSet]) {
+            if (!$isSet) {
+                continue;
+            }
+
+            $value = $_GET[$parameter];
+            if (!is_string($value)) {
+                $this->sendError(
+                    400,
+                    'invalid time filter parameter',
+                    $parameter . ' must be a string'
+                );
+                exit;
+            }
+
+            $value = trim($value);
+            $timestamp = TimeWindowFilter::parseTimestamp($value);
+            if ($timestamp === null) {
+                $this->sendError(
+                    400,
+                    'invalid time filter parameter',
+                    $parameter . ' must be an ISO-8601 date or timestamp'
+                );
+                exit;
+            }
+
+            $window[$criterion] = $timestamp;
+            $window[$criterion . '_value'] = $value;
+        }
+
+        if ($window['from'] !== null && $window['until'] !== null && $window['from'] > $window['until']) {
+            $this->sendError(
+                400,
+                'invalid time filter window',
+                $fromParameter . ' must not be later than ' . $untilParameter
+            );
+            exit;
+        }
+
+        return $window;
+    }
+
+    /**
      * Serve cached response
      */
     private function serveCache(array $entry, string $cacheStatus, string $method, string $geometryMode): void
@@ -554,11 +634,47 @@ final class Application
         $etag = $pointMode ? $entry['point_etag'] : $entry['etag'];
         $bytes = $this->cacheManager->getEntryBytes($entry, $geometryMode);
         $path = $this->cacheManager->getEntryPath($entry, $geometryMode);
+        $body = null;
+        $timeFilterStatistics = null;
+
+        if ($this->requestTimeWindow !== null) {
+            $body = file_get_contents($path);
+            if ($body === false || strlen($body) !== $bytes) {
+                $this->sendError(500, 'could not read cached GeoJSON');
+                return;
+            }
+
+            try {
+                $document = Parser::parse($body);
+                unset($body);
+
+                $timeFilterStatistics = TimeWindowFilter::filterFeatureCollection(
+                    $document,
+                    $this->config->getString('time_filter_start_property'),
+                    $this->config->getString('time_filter_end_property'),
+                    $this->requestTimeWindow['from'],
+                    $this->requestTimeWindow['until']
+                );
+                $body = $this->encodeFeatureCollectionForApi($document);
+                unset($document);
+            } catch (\Throwable $e) {
+                Logger::logException('could not apply request time filter', $e);
+                $this->sendError(500, 'could not apply time filter to cached GeoJSON');
+                return;
+            }
+
+            $bytes = strlen($body);
+            if ($bytes > $this->config->getInt('max_bytes')) {
+                $this->sendError(500, 'time-filtered result exceeds MAX_BYTES');
+                return;
+            }
+            $etag = '"' . hash('sha256', $body) . '"';
+        }
+
         $ifNoneMatch = $_SERVER['HTTP_IF_NONE_MATCH'] ?? '';
         $notModified = $this->etagHeaderMatches($ifNoneMatch, $etag);
-        $body = null;
 
-        if (!$notModified && $method !== 'HEAD') {
+        if ($this->requestTimeWindow === null && !$notModified && $method !== 'HEAD') {
             $body = file_get_contents($path);
             if ($body === false || strlen($body) !== $bytes) {
                 $this->sendError(500, 'could not read cached GeoJSON');
@@ -572,6 +688,11 @@ final class Application
             'geometry_mode' => $geometryMode,
             'response_bytes' => $bytes,
             'etag' => $etag,
+            'time_filter' => $this->requestTimeWindow === null ? null : [
+                'from' => $this->requestTimeWindow['from_value'],
+                'until' => $this->requestTimeWindow['until_value'],
+                'statistics' => $timeFilterStatistics,
+            ],
         ]);
 
         $this->setCORSHeaders();
@@ -750,6 +871,14 @@ Configuration:
                  Exact, case-sensitive values allowed by the attribute filter.
                  At least one configured value must occur in a feature. An
                  empty array disables this additional attribute filter.
+  TIME_FILTER_START_PROPERTY
+                 Feature property containing the interval start time.
+  TIME_FILTER_END_PROPERTY
+                 Feature property containing the interval end time.
+  TIME_FILTER_FROM_PARAMETER
+                 URL parameter for the inclusive lower request boundary.
+  TIME_FILTER_UNTIL_PARAMETER
+                 URL parameter for the inclusive upper request boundary.
   CACHE_DIR      Writable cache directory.
   CACHE_TTL      Fresh result-cache lifetime.
   STALE_TTL      Stale-cache lifetime after refresh errors.
@@ -767,6 +896,9 @@ Web usage:
 
   Point representation (centroid or robust fallback per feature):
   https://your-domain.example/public/index.php?geometry=point
+
+  Features whose intervals overlap an optional request time window:
+  https://your-domain.example/public/index.php?from=2025-01-01T00%3A00%3A00Z&until=2025-01-31T23%3A59%3A59Z
 
 Status endpoint:
 
@@ -806,6 +938,10 @@ Notes:
   The source GeoJSON must be a FeatureCollection.
   When ALLOWED_TRANSPORT_MODE_TYPES is not empty, a feature must have a
   matching string in properties[TRANSPORT_MODE_PROPERTY].
+  Time filtering is disabled when neither configured URL parameter is set.
+  The from boundary compares against TIME_FILTER_END_PROPERTY; the until
+  boundary compares against TIME_FILTER_START_PROPERTY. Boundaries are
+  inclusive and timestamps use ISO 8601.
   Buffer data may be a Geometry, Feature, FeatureCollection, or
   GeometryCollection containing Polygon or MultiPolygon geometries.
   Buffer polygons are processed one at a time.

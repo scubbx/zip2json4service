@@ -76,6 +76,10 @@ final class Config
             'buffer_url' => \BUFFER_URL,
             'transport_mode_property' => \TRANSPORT_MODE_PROPERTY,
             'allowed_transport_mode_types' => $this->normalizeAllowedTransportModeTypes(\ALLOWED_TRANSPORT_MODE_TYPES),
+            'time_filter_start_property' => \TIME_FILTER_START_PROPERTY,
+            'time_filter_end_property' => \TIME_FILTER_END_PROPERTY,
+            'time_filter_from_parameter' => \TIME_FILTER_FROM_PARAMETER,
+            'time_filter_until_parameter' => \TIME_FILTER_UNTIL_PARAMETER,
             'cache_dir' => \CACHE_DIR,
             'cache_ttl' => $this->parseDuration(\CACHE_TTL),
             'stale_ttl' => $this->parseDuration(\STALE_TTL),
@@ -112,6 +116,23 @@ final class Config
 
         if (!is_array($this->data['allowed_transport_mode_types'])) {
             throw new RuntimeException('ALLOWED_TRANSPORT_MODE_TYPES must be an array');
+        }
+
+        foreach ([
+            'time_filter_start_property' => 'TIME_FILTER_START_PROPERTY',
+            'time_filter_end_property' => 'TIME_FILTER_END_PROPERTY',
+            'time_filter_from_parameter' => 'TIME_FILTER_FROM_PARAMETER',
+            'time_filter_until_parameter' => 'TIME_FILTER_UNTIL_PARAMETER',
+        ] as $key => $constantName) {
+            if (!is_string($this->data[$key]) || trim($this->data[$key]) === '') {
+                throw new RuntimeException($constantName . ' must not be empty');
+            }
+        }
+
+        if ($this->data['time_filter_from_parameter'] === $this->data['time_filter_until_parameter']) {
+            throw new RuntimeException(
+                'TIME_FILTER_FROM_PARAMETER and TIME_FILTER_UNTIL_PARAMETER must be different'
+            );
         }
 
         if ($this->data['cache_ttl'] <= 0) {

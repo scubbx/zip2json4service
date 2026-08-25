@@ -7,6 +7,7 @@ This document provides guidance for AI agents (like Mistral AI's Vibe Code) work
 This is **uMap GeoJSON Spatial Filter Proxy** - a PHP-based application that:
 - Downloads GeoJSON data from remote sources
 - Filters features spatially against buffer polygons
+- Optionally filters cached results by a request-specific validity interval
 - Serves filtered results with intelligent caching
 - Supports both full geometries and point representations
 
@@ -35,7 +36,8 @@ This is **uMap GeoJSON Spatial Filter Proxy** - a PHP-based application that:
 │   │   ├── Point.php         # Point utilities and comparisons
 │   │   ├── PreparedPolygon.php # Compact buffer-polygon preparation and queries
 │   │   ├── Segment.php       # Line segment intersection detection
-│   │   └── SpatialFilter.php # Core spatial filtering logic
+│   │   ├── SpatialFilter.php # Core spatial filtering logic
+│   │   └── TimeWindowFilter.php # Request time-window filtering
 │   ├── Http/
 │   │   ├── Fetcher.php      # HTTP client with gzip support
 │   │   └── GzipDetector.php # Gzip magic bytes detection
@@ -70,6 +72,8 @@ The integration test (`test_php_proxy.py`) covers:
 - All GeoJSON geometry types (Point, LineString, Polygon, Multi*, GeometryCollection)
 - Spatial filtering accuracy, including holes, boundaries, open rings, and degenerate edge cases
 - Full and point representations plus transport-mode attribute filtering
+- Configurable time properties/parameters, one-sided and two-sided intervals,
+  inclusive boundaries, validation errors, and response-specific ETags
 - Cache HIT, MISS, STALE, cache-key invalidation, integrity checks, and stale expiry
 - ETag/304, HEAD, OPTIONS, CORS, status endpoint, and CLI behavior
 - Concurrent cold-cache requests and refresh-lock coordination
@@ -93,6 +97,9 @@ The positional argument is the project directory, not the PHP entry point. The t
 All user-configurable settings are in `config/config.php` as constants:
 - URLs for source and buffer GeoJSON
 - Transport mode filtering settings
+- Time-filter property names and URL parameter names. The shipped defaults use
+  the EVIS GeoJSON properties `start-time`/`stop-time` and request parameters
+  `from`/`until`.
 - Cache directories and TTLs
 - Size limits and timeouts
 - Debug and logging settings
@@ -117,7 +124,11 @@ The core filtering logic in `SpatialFilter::filterByBufferPolygons()`:
 #### Caching Strategy
 - **Fresh Cache**: Served directly without upstream requests
 - **Stale Cache**: Served when refresh fails but still within stale TTL
-- **Cache Invalidation**: Based on configuration changes (version, URLs, filter settings)
+- **Cache Invalidation**: Based on configuration changes that affect upstream
+  preparation (version, URLs, transport-mode filter settings)
+- **Request Time Filtering**: Applied after loading the full or point cache.
+  Never write a request-specific time-window result back to the shared cache;
+  `--warm-cache` must remain independent of URL parameters.
 - **Atomic Writes**: Temporary files + rename for atomic cache updates
 - **Locking**: File-based locking (`refresh.lock`) prevents race conditions
 
