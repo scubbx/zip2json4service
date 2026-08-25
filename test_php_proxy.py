@@ -8,6 +8,7 @@ configuration constants in config/config.php. The original files are never modif
 Covered behavior:
 
 * source and buffer GeoJSON are fetched as gzip payloads;
+* buffer polygons are processed through compact grid and point indexes;
 * Point, LineString, Polygon, MultiPoint, MultiLineString, MultiPolygon, and
   GeometryCollection features are spatially filtered;
 * polygon holes and boundary intersections are handled;
@@ -939,6 +940,23 @@ def run_tests(args: argparse.Namespace) -> None:
             assert_true(cache_meta.get("point_etag"), "point ETag should be stored")
             assert_true(cache_meta.get("point_bytes", 0) > 0, "point byte count should be stored")
             assert_true(cache_meta.get("cache_key"), "cache key should be stored")
+
+            proxy_log_path = cache_dir / "proxy.log"
+            index_events = []
+            for log_line in proxy_log_path.read_text(encoding="utf-8").splitlines():
+                log_entry = json.loads(log_line)
+                if log_entry.get("message") == "buffer polygon processed with compact spatial indexes":
+                    index_events.append(log_entry)
+
+            assert_true(index_events, "spatial filtering should use compact polygon indexes")
+            assert_true(
+                all(int(event.get("current_polygon_segments", 0)) > 0 for event in index_events),
+                "each prepared polygon should contain indexed segments",
+            )
+            assert_true(
+                all(int(event.get("current_compact_index_bytes", 0)) > 0 for event in index_events),
+                "each prepared polygon should report a non-empty compact index",
+            )
 
             print("Test 1b: point mode uses the same refresh and returns one centroid-like Point per retained feature")
             status, point_headers, initial_point_body = http_request("GET", point_url)

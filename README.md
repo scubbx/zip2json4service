@@ -766,6 +766,7 @@ Mögliche Stufen:
 │   │   ├── GeometryExtractor.php # Geometrie-Extraktion
 │   │   ├── Parser.php        # JSON-Parsing
 │   │   ├── Point.php         # Punkt-Utilities
+│   │   ├── PreparedPolygon.php # Kompakter Pufferpolygon-Index
 │   │   ├── Segment.php       # Segment-Schnittprüfung
 │   │   └── SpatialFilter.php # Räumliche Filterung
 │   ├── Http/

@@ -33,14 +33,15 @@ This is **uMap GeoJSON Spatial Filter Proxy** - a PHP-based application that:
 │   │   ├── GeometryExtractor.php # Extract polygons from complex GeoJSON
 │   │   ├── Parser.php        # JSON parsing with validation
 │   │   ├── Point.php         # Point utilities and comparisons
+│   │   ├── PreparedPolygon.php # Compact buffer-polygon preparation and queries
 │   │   ├── Segment.php       # Line segment intersection detection
 │   │   └── SpatialFilter.php # Core spatial filtering logic
 │   ├── Http/
 │   │   ├── Fetcher.php      # HTTP client with gzip support
 │   │   └── GzipDetector.php # Gzip magic bytes detection
 │   └── SpatialIndex/
-│       ├── GridIndex.php    # Grid-based spatial index (for future optimization)
-│       └── PointIndex.php   # Point-in-polygon index (for future optimization)
+│       ├── GridIndex.php    # Grid index for buffer-boundary segments
+│       └── PointIndex.php   # Y-bucket index for point-in-polygon tests
 ├── test_php_proxy.py         # Integration test suite
 └── README.md                # User documentation
 ```
@@ -104,7 +105,10 @@ All user-configurable settings are in `config/config.php` as constants:
 The core filtering logic in `SpatialFilter::filterByBufferPolygons()`:
 
 1. **Bounding Box Optimization**: Quick rejection using axis-aligned bounding boxes
-2. **Geometric Intersection**: Full geometric checks for accurate results:
+2. **Prepared Buffer Polygons**: Pack each polygon's segments once and build:
+   - A uniform grid for boundary intersection candidates
+   - Y-buckets for point-in-polygon candidates
+3. **Geometric Intersection**: Full geometric checks for accurate results:
    - Point-in-Polygon (with hole support)
    - Segment-segment intersection
    - Polygon overlap detection
@@ -181,11 +185,10 @@ git log --oneline -10
 
 ## Areas for Future Improvement
 
-1. **Spatial Indexes**: The `GridIndex` and `PointIndex` classes are placeholders for future optimization
-2. **Performance**: Consider streaming JSON parsing for very large files
-3. **Configuration**: Could add environment variable support
-4. **Validation**: More robust GeoJSON validation
-5. **CRS Support**: Add coordinate transformation capabilities
+1. **Performance**: Consider streaming JSON parsing for very large files
+2. **Configuration**: Could add environment variable support
+3. **Validation**: More robust GeoJSON validation
+4. **CRS Support**: Add coordinate transformation capabilities
 
 ## Getting Help
 
