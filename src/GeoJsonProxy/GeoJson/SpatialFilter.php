@@ -16,7 +16,7 @@ use GeoJsonProxy\GeoJson\Segment;
 final class SpatialFilter
 {
     /**
-     * Filter features by buffer polygons (simplified version)
+     * Filter features by buffer polygons
      *
      * @param array &$source Source GeoJSON document
      * @param array $polygonCoordinates List of polygon coordinates
@@ -39,17 +39,23 @@ final class SpatialFilter
         $features =& $source['features'];
         $candidateCount = count($features);
 
-        // For now, use a simple bounding box intersection check
-        // This is a simplified version - the full implementation would use spatial indexes
-        $bufferBboxes = [];
+        if ($polygonCoordinates === []) {
+            throw new RuntimeException('buffer GeoJSON contains no Polygon or MultiPolygon geometry');
+        }
+
+        // Build buffer polygons with their bounding boxes for optimization
+        $bufferPolygons = [];
         foreach ($polygonCoordinates as $polygon) {
             $bbox = BoundingBox::fromCoordinates($polygon);
             if ($bbox !== null) {
-                $bufferBboxes[] = $bbox;
+                $bufferPolygons[] = [
+                    'coordinates' => $polygon,
+                    'bbox' => $bbox,
+                ];
             }
         }
 
-        if ($bufferBboxes === []) {
+        if ($bufferPolygons === []) {
             throw new RuntimeException('buffer GeoJSON contains no valid Polygon or MultiPolygon geometry');
         }
 
@@ -71,9 +77,22 @@ final class SpatialFilter
                 continue;
             }
 
-            // Check if feature bbox intersects any buffer bbox
-            foreach ($bufferBboxes as $bufferBbox) {
-                if (BoundingBox::intersect($featureBbox, $bufferBbox)) {
+            // First check: bounding box intersection for quick rejection
+            $bboxMatched = false;
+            foreach ($bufferPolygons as $bufferPoly) {
+                if (BoundingBox::intersect($featureBbox, $bufferPoly['bbox'])) {
+                    $bboxMatched = true;
+                    break;
+                }
+            }
+
+            if (!$bboxMatched) {
+                continue;
+            }
+
+            // Full geometric check against each buffer polygon
+            foreach ($bufferPolygons as $bufferPoly) {
+                if (self::geometryIntersectsPolygon($geometry, $bufferPoly['coordinates'])) {
                     $matched[$featureIndex] = true;
                     $matchedCount++;
                     break;
@@ -105,12 +124,12 @@ final class SpatialFilter
         return array_merge($attributeStatistics, [
             'retained_features' => $writeIndex,
             'spatially_rejected_features' => $candidateCount - $writeIndex,
-            'buffer_polygons' => count($bufferBboxes),
+            'buffer_polygons' => count($bufferPolygons),
         ]);
     }
 
     /**
-     * Check if point is in polygon (simplified version)
+     * Check if point is in polygon
      */
     public static function pointInPolygon(array $point, array $polygon): bool
     {
