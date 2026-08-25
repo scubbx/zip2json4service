@@ -684,6 +684,9 @@ def run_tests(args: argparse.Namespace) -> None:
     php_process: subprocess.Popen[str] | None = None
 
     try:
+        # Wait for mock server to be ready before proceeding
+        wait_for_port(mock_port, timeout=10)
+
         with tempfile.TemporaryDirectory(prefix="geojson-spatial-proxy-test-") as tmp:
             tmp_dir = Path(tmp)
             php_dir = tmp_dir / "php"
