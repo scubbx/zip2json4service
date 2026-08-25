@@ -4,12 +4,12 @@ declare(strict_types=1);
 
 namespace GeoJsonProxy\SpatialIndex;
 
-use const GeoJsonProxy\GEO_EPSILON;
-use const GeoJsonProxy\PACKED_ID_BYTES;
-use const GeoJsonProxy\POINT_INDEX_TARGET_EDGES_PER_BUCKET;
-use const GeoJsonProxy\POINT_INDEX_MAX_BUCKETS;
-use const GeoJsonProxy\POINT_INDEX_MAX_BUCKETS_PER_EDGE;
-use const GeoJsonProxy\POINT_INDEX_MAX_REFERENCE_BYTES;
+use const GEO_EPSILON;
+use const PACKED_ID_BYTES;
+use const POINT_INDEX_TARGET_EDGES_PER_BUCKET;
+use const POINT_INDEX_MAX_BUCKETS;
+use const POINT_INDEX_MAX_BUCKETS_PER_EDGE;
+use const POINT_INDEX_MAX_REFERENCE_BYTES;
 
 use GeoJsonProxy\GeoJson\Segment;
 use GeoJsonProxy\GeoJson\BoundingBox;

@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace GeoJsonProxy\GeoJson;
 
-use const GeoJsonProxy\GEO_EPSILON;
-use const GeoJsonProxy\PACKED_SEGMENT_BYTES;
+use const GEO_EPSILON;
+use const PACKED_SEGMENT_BYTES;
 
 /**
  * Segment intersection utilities

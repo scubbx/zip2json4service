@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace GeoJsonProxy\GeoJson;
 
-use const GeoJsonProxy\GEO_EPSILON;
+use const GEO_EPSILON;
 
 /**
  * Bounding box utilities

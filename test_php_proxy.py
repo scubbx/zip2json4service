@@ -595,6 +595,15 @@ def lint_php_script(php_bin: str, php_script: Path) -> None:
         raise RuntimeError(f"PHP syntax check failed:\n{result.stdout}")
 
 
+def lint_php_project(php_bin: str, project_dir: Path) -> None:
+    php_scripts = sorted(project_dir.rglob("*.php"))
+    if not php_scripts:
+        raise RuntimeError(f"No PHP files found in project directory: {project_dir}")
+
+    for php_script in php_scripts:
+        lint_php_script(php_bin, php_script)
+
+
 def start_php_server(
     php_bin: str,
     php_dir: Path,
@@ -700,7 +709,7 @@ def run_tests(args: argparse.Namespace) -> None:
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
                 cache_dir=cache_dir,
             )
-            lint_php_script(php_bin, configured_script)
+            lint_php_project(php_bin, php_dir)
 
             php_process = start_php_server(
                 php_bin=php_bin,

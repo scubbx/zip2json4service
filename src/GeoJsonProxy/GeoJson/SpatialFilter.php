@@ -116,7 +116,7 @@ final class SpatialFilter
             $writeIndex++;
         }
 
-        unset($features[$writeIndex] ?? null);
+        unset($features[$writeIndex]);
 
         // Remove source-level bbox as it may no longer be valid
         unset($source['bbox']);

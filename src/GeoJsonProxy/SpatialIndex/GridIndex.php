@@ -4,13 +4,13 @@ declare(strict_types=1);
 
 namespace GeoJsonProxy\SpatialIndex;
 
-use const GeoJsonProxy\GEO_EPSILON;
-use const GeoJsonProxy\PACKED_ID_BYTES;
-use const GeoJsonProxy\SPATIAL_INDEX_TARGET_SEGMENTS_PER_CELL;
-use const GeoJsonProxy\SPATIAL_INDEX_MAX_TOTAL_CELLS;
-use const GeoJsonProxy\SPATIAL_INDEX_MAX_GRID_DIMENSION;
-use const GeoJsonProxy\SPATIAL_INDEX_MAX_CELLS_PER_SEGMENT;
-use const GeoJsonProxy\SPATIAL_INDEX_MAX_REFERENCE_BYTES;
+use const GEO_EPSILON;
+use const PACKED_ID_BYTES;
+use const SPATIAL_INDEX_TARGET_SEGMENTS_PER_CELL;
+use const SPATIAL_INDEX_MAX_TOTAL_CELLS;
+use const SPATIAL_INDEX_MAX_GRID_DIMENSION;
+use const SPATIAL_INDEX_MAX_CELLS_PER_SEGMENT;
+use const SPATIAL_INDEX_MAX_REFERENCE_BYTES;
 
 use GeoJsonProxy\GeoJson\Segment;
 use GeoJsonProxy\GeoJson\BoundingBox;
