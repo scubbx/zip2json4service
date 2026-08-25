@@ -64,19 +64,28 @@ This is **uMap GeoJSON Spatial Filter Proxy** - a PHP-based application that:
 ### Testing
 
 The integration test (`test_php_proxy.py`) covers:
-- HTTP fetching and gzip decompression
+- PHP syntax checking for every PHP file in the configured project copy
+- Gzip and plain-JSON fetching, redirects, size limits, and malformed upstream payloads
 - All GeoJSON geometry types (Point, LineString, Polygon, Multi*, GeometryCollection)
-- Spatial filtering accuracy (including holes, boundaries, overlaps)
-- Transport mode attribute filtering
-- Caching behavior (HIT, MISS, STALE)
-- Point representation generation
-- ETag and 304 Not Modified responses
-- Error handling (502, 400, 405)
+- Spatial filtering accuracy, including holes, boundaries, open rings, and degenerate edge cases
+- Full and point representations plus transport-mode attribute filtering
+- Cache HIT, MISS, STALE, cache-key invalidation, integrity checks, and stale expiry
+- ETag/304, HEAD, OPTIONS, CORS, status endpoint, and CLI behavior
+- Concurrent cold-cache requests and refresh-lock coordination
+- Error handling and invalid configuration
 
 **Run tests**:
 ```bash
-python3 test_php_proxy.py public/index.php
+python3 test_php_proxy.py .
+
+# Include PHP development-server output when diagnosing a failure
+python3 test_php_proxy.py . --show-php-log
+
+# Use a specific PHP binary
+python3 test_php_proxy.py . --php-bin /path/to/php
 ```
+
+The positional argument is the project directory, not the PHP entry point. The test creates temporary configured project copies and cache directories, starts mock upstream and PHP servers on ephemeral `127.0.0.1` ports, and does not modify the source configuration.
 
 ### Configuration
 
@@ -154,12 +163,11 @@ The modular branch is the active development branch and should be used for new w
 ## Useful Commands
 
 ```bash
-# Validate PHP syntax (if PHP available)
-php -l public/index.php
-php -l src/GeoJsonProxy/Application.php
+# Validate all PHP files (if PHP is available)
+find config public src -type f -name '*.php' -print0 | sort -z | xargs -0 -n1 php -l
 
 # Run integration tests
-python3 test_php_proxy.py public/index.php
+python3 test_php_proxy.py .
 
 # Check Python test syntax
 python3 -m py_compile test_php_proxy.py

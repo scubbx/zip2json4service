@@ -11,6 +11,7 @@ Ein PHP-basierter Proxy, der GeoJSON-Daten herunterlädt, Features räumlich geg
 - [Installation auf dem eigenen Webspace](#installation-auf-dem-eigenen-webspace)
 - [Konfiguration](#konfiguration)
 - [Verwendung](#verwendung)
+- [Entwicklung und Tests](#entwicklung-und-tests)
 - [uMap-Integration](#umap-integration)
 - [Betrieb und Wartung](#betrieb-und-wartung)
 - [Fehlerbehebung](#fehlerbehebung)
@@ -416,6 +417,37 @@ Cache-Control: public, max-age=900
 
 ---
 
+## Entwicklung und Tests
+
+Der Integrationstest benötigt Python 3, PHP CLI mit zlib-Unterstützung und die Möglichkeit, lokale Server auf `127.0.0.1` zu starten. Er erstellt eine temporäre Kopie des Projekts mit eigener Konfiguration und eigenen Cache-Verzeichnissen. Die Dateien und die Konfiguration im Arbeitsverzeichnis werden dabei nicht verändert.
+
+Führen Sie den Test aus dem Projektverzeichnis aus:
+
+```bash
+# Vollständige Integrationssuite
+python3 test_php_proxy.py .
+
+# Zusätzlich die Ausgaben der gestarteten PHP-Entwicklungsserver anzeigen
+python3 test_php_proxy.py . --show-php-log
+
+# Bestimmte PHP-Installation verwenden
+python3 test_php_proxy.py . --php-bin /pfad/zu/php
+```
+
+Der Test prüft unter anderem:
+
+- die Syntax aller PHP-Dateien in der temporär konfigurierten Projektkopie;
+- gzip-komprimierte und unkomprimierte Upstream-Daten, Redirects, Größenlimits und fehlerhafte Payloads;
+- alle unterstützten GeoJSON-Geometrietypen sowie Löcher, Grenzberührungen und degenerierte Randfälle;
+- vollständige und punktförmige Repräsentationen einschließlich Transportmodusfilter;
+- Cache `MISS`, `HIT` und `STALE`, Cache-Key-Invalidierung, beschädigte Cache-Dateien und den Ablauf von `stale_until`;
+- ETags, `304 Not Modified`, `HEAD`, `OPTIONS`, CORS, Status-Endpunkt und CLI-Befehle;
+- konkurrierende Cold-Cache-Anfragen und die Verriegelung des gemeinsamen Refreshs.
+
+Bei Erfolg endet die Ausgabe mit `All tests passed.`. Der Test verwendet ausschließlich temporäre Verzeichnisse und lokale Mock-Upstreams; ein Internetzugang ist nicht erforderlich.
+
+---
+
 ## uMap-Integration
 
 ### Schritt 1: Layer in uMap erstellen
@@ -720,28 +752,29 @@ Mögliche Stufen:
 │   └── dependencies.php    # Autoloading-Konfiguration
 ├── public/
 │   └── index.php           # Öffentlicher Einstiegspunkt
-└── src/GeoJsonProxy/
-    ├── Application.php      # Hauptanwendung
-    ├── Config.php           # Konfiguration
-    ├── Cache/
-    │   └── Manager.php      # Cache-Verwaltung
-    ├── Diagnostics/
-    │   └── Logger.php       # Logging
-    ├── GeoJson/
-    │   ├── BoundingBox.php   # Bounding-Box-Utilities
-    │   ├── Centroid.php     # Schwerpunktberechnung
-    │   ├── FeatureFilter.php # Attributfilter
-    │   ├── GeometryExtractor.php # Geometrie-Extraktion
-    │   ├── Parser.php        # JSON-Parsing
-    │   ├── Point.php         # Punkt-Utilities
-    │   ├── Segment.php       # Segment-Schnittprüfung
-    │   └── SpatialFilter.php # Räumliche Filterung
-    ├── Http/
-    │   ├── Fetcher.php      # HTTP-Client
-    │   └── GzipDetector.php # Gzip-Erkennung
-    └── SpatialIndex/
-        ├── GridIndex.php     # Raster-Index
-        └── PointIndex.php    # Punkt-Index
+├── src/GeoJsonProxy/
+│   ├── Application.php      # Hauptanwendung
+│   ├── Config.php           # Konfiguration
+│   ├── Cache/
+│   │   └── Manager.php      # Cache-Verwaltung
+│   ├── Diagnostics/
+│   │   └── Logger.php       # Logging
+│   ├── GeoJson/
+│   │   ├── BoundingBox.php   # Bounding-Box-Utilities
+│   │   ├── Centroid.php     # Schwerpunktberechnung
+│   │   ├── FeatureFilter.php # Attributfilter
+│   │   ├── GeometryExtractor.php # Geometrie-Extraktion
+│   │   ├── Parser.php        # JSON-Parsing
+│   │   ├── Point.php         # Punkt-Utilities
+│   │   ├── Segment.php       # Segment-Schnittprüfung
+│   │   └── SpatialFilter.php # Räumliche Filterung
+│   ├── Http/
+│   │   ├── Fetcher.php      # HTTP-Client
+│   │   └── GzipDetector.php # Gzip-Erkennung
+│   └── SpatialIndex/
+│       ├── GridIndex.php     # Raster-Index
+│       └── PointIndex.php    # Punkt-Index
+└── test_php_proxy.py         # Integrationssuite
 ```
 
 ---

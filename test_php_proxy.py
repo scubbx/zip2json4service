@@ -22,12 +22,15 @@ Covered behavior:
 * an invalid buffer dataset without polygons produces HTTP 502 when no stale
   cache is available;
 * the optional affected-transportmode-types allow-list uses OR semantics,
-  rejects missing/non-matching values, and participates in cache invalidation.
+  rejects missing/non-matching values, and participates in cache invalidation;
+* malformed upstream payloads, plain JSON, size limits, stale expiry, cache
+  corruption, status/CLI behavior, and concurrent refresh locking are covered.
 """
 
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import gzip
 import http.client
 import json
@@ -54,6 +57,11 @@ def square(min_x: float, min_y: float, max_x: float, max_y: float) -> list[list[
         [min_x, max_y],
         [min_x, min_y],
     ]
+
+
+def open_square(min_x: float, min_y: float, max_x: float, max_y: float) -> list[list[float]]:
+    """Return a rectangular ring whose closing coordinate is omitted."""
+    return square(min_x, min_y, max_x, max_y)[:-1]
 
 
 def feature(feature_id: str, geometry: dict[str, Any] | None) -> dict[str, Any]:
@@ -87,6 +95,22 @@ SOURCE_GEOJSON: dict[str, Any] = {
             {"type": "LineString", "coordinates": [[-2, 2], [2, 2]]},
         ),
         feature(
+            "line_touches_vertex",
+            {"type": "LineString", "coordinates": [[-1, -1], [0, 0]]},
+        ),
+        feature(
+            "line_collinear_boundary",
+            {"type": "LineString", "coordinates": [[2, 0], [8, 0]]},
+        ),
+        feature(
+            "zero_length_line_inside",
+            {"type": "LineString", "coordinates": [[2, 2], [2, 2]]},
+        ),
+        feature(
+            "zero_length_line_outside",
+            {"type": "LineString", "coordinates": [[12, 12], [12, 12]]},
+        ),
+        feature(
             "line_only_in_hole",
             {"type": "LineString", "coordinates": [[4.5, 5], [5.5, 5]]},
         ),
@@ -105,6 +129,21 @@ SOURCE_GEOJSON: dict[str, Any] = {
         feature(
             "polygon_overlaps",
             {"type": "Polygon", "coordinates": [square(9, 9, 12, 12)]},
+        ),
+        feature(
+            "polygon_touches_vertex",
+            {"type": "Polygon", "coordinates": [square(-1, -1, 0, 0)]},
+        ),
+        feature(
+            "polygon_open_ring_inside",
+            {"type": "Polygon", "coordinates": [open_square(2, 2, 3, 3)]},
+        ),
+        feature(
+            "degenerate_polygon_inside",
+            {
+                "type": "Polygon",
+                "coordinates": [[[2, 2], [3, 2], [2, 2]]],
+            },
         ),
         feature(
             "polygon_with_hole_centroid",
@@ -192,6 +231,14 @@ SOURCE_GEOJSON: dict[str, Any] = {
                 ],
             },
         ),
+        feature(
+            "empty_geometrycollection",
+            {"type": "GeometryCollection", "geometries": []},
+        ),
+        feature(
+            "unsupported_geometry",
+            {"type": "CircularString", "coordinates": [[1, 1], [2, 2]]},
+        ),
         feature("point_moved", {"type": "Point", "coordinates": [105, 105]}),
         feature(
             "line_moved",
@@ -254,8 +301,8 @@ INITIAL_BUFFER_GEOJSON: dict[str, Any] = {
             "geometry": {
                 "type": "Polygon",
                 "coordinates": [
-                    square(0, 0, 10, 10),
-                    square(4, 4, 6, 6),
+                    open_square(0, 0, 10, 10),
+                    open_square(4, 4, 6, 6),
                 ],
             },
         },
@@ -311,9 +358,15 @@ EXPECTED_INITIAL_IDS = [
     "point_second_buffer",
     "point_third_buffer",
     "line_crosses",
+    "line_touches_vertex",
+    "line_collinear_boundary",
+    "zero_length_line_inside",
     "polygon_inside",
     "polygon_contains_buffer",
     "polygon_overlaps",
+    "polygon_touches_vertex",
+    "polygon_open_ring_inside",
+    "degenerate_polygon_inside",
     "polygon_with_hole_centroid",
     "multipoint_hit",
     "multiline_hit",
@@ -334,6 +387,10 @@ class MockState:
     source_fail = False
     buffer_fail = False
     buffer_variant = "initial"
+    source_mode = "gzip"
+    buffer_mode = "gzip"
+    source_delay_seconds = 0.0
+    buffer_delay_seconds = 0.0
 
     @classmethod
     def reset(cls) -> None:
@@ -343,6 +400,10 @@ class MockState:
             cls.source_fail = False
             cls.buffer_fail = False
             cls.buffer_variant = "initial"
+            cls.source_mode = "gzip"
+            cls.buffer_mode = "gzip"
+            cls.source_delay_seconds = 0.0
+            cls.buffer_delay_seconds = 0.0
 
     @classmethod
     def counts(cls) -> tuple[int, int]:
@@ -362,26 +423,77 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # Size-limit tests intentionally stop reading once MAX_BYTES is hit.
+            return
+
+    def send_redirect(self, location: str) -> None:
+        self.send_response(302)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+    @staticmethod
+    def encode_document(document: dict[str, Any], mode: str) -> tuple[str, bytes]:
+        raw = json.dumps(
+            document,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        if mode == "gzip":
+            return "application/gzip", gzip.compress(raw)
+        if mode == "plain":
+            return "application/geo+json", raw
+        if mode == "invalid_json":
+            return "application/json", b'{"type":"FeatureCollection","features":['
+        if mode == "json_scalar":
+            return "application/json", b'"not a GeoJSON object"'
+        if mode == "corrupt_gzip":
+            return "application/gzip", b"\x1f\x8bnot-a-valid-gzip-stream"
+        if mode == "wrong_source_type":
+            wrong = {"type": "Feature", "properties": {}, "geometry": None}
+            return "application/geo+json", json.dumps(wrong).encode("utf-8")
+        if mode == "missing_features":
+            wrong = {"type": "FeatureCollection"}
+            return "application/geo+json", json.dumps(wrong).encode("utf-8")
+        if mode == "oversized_body":
+            return "application/octet-stream", b"x" * 4096
+        if mode == "gzip_bomb":
+            return "application/gzip", gzip.compress(b" " * 4096)
+
+        raise RuntimeError(f"Unknown mock response mode: {mode}")
 
     def do_GET(self) -> None:
         path = urlparse(self.path).path
+
+        if path == "/source-redirect":
+            self.send_redirect("/source")
+            return
+
+        if path == "/buffer-redirect":
+            self.send_redirect("/buffer")
+            return
 
         if path == "/source":
             with MockState.lock:
                 MockState.source_request_count += 1
                 should_fail = MockState.source_fail
+                mode = MockState.source_mode
+                delay = MockState.source_delay_seconds
+
+            if delay > 0:
+                time.sleep(delay)
 
             if should_fail:
                 self.send_bytes(503, "text/plain", b"source currently failing\n")
                 return
 
-            raw = json.dumps(
-                SOURCE_GEOJSON,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            self.send_bytes("200" if False else 200, "application/gzip", gzip.compress(raw))
+            content_type, body = self.encode_document(SOURCE_GEOJSON, mode)
+            self.send_bytes(200, content_type, body)
             return
 
         if path == "/buffer":
@@ -389,6 +501,11 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
                 MockState.buffer_request_count += 1
                 should_fail = MockState.buffer_fail
                 variant = MockState.buffer_variant
+                mode = MockState.buffer_mode
+                delay = MockState.buffer_delay_seconds
+
+            if delay > 0:
+                time.sleep(delay)
 
             if should_fail:
                 self.send_bytes(503, "text/plain", b"buffer currently failing\n")
@@ -404,12 +521,8 @@ class MockUpstreamHandler(BaseHTTPRequestHandler):
                 self.send_bytes(500, "text/plain", b"unknown buffer variant\n")
                 return
 
-            raw = json.dumps(
-                document,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-            self.send_bytes(200, "application/gzip", gzip.compress(raw))
+            content_type, body = self.encode_document(document, mode)
+            self.send_bytes(200, content_type, body)
             return
 
         self.send_bytes(404, "text/plain", b"not found\n")
@@ -547,6 +660,10 @@ def create_configured_php_copy(
     buffer_url: str,
     cache_dir: Path,
     allowed_transport_mode_types: list[str] | None = None,
+    cache_ttl: str = "1s",
+    stale_ttl: str = "20s",
+    max_bytes: int = 10 * 1024 * 1024,
+    http_timeout: int = 5,
 ) -> Path:
     """Copy the entire project structure and patch config constants."""
     # Copy the entire project structure
@@ -563,10 +680,10 @@ def create_configured_php_copy(
         "SOURCE_URL": php_string(source_url),
         "BUFFER_URL": php_string(buffer_url),
         "CACHE_DIR": php_string(str(cache_dir.resolve())),
-        "CACHE_TTL": php_string("1s"),
-        "STALE_TTL": php_string("20s"),
-        "MAX_BYTES": str(10 * 1024 * 1024),
-        "HTTP_TIMEOUT": "5",
+        "CACHE_TTL": php_string(cache_ttl),
+        "STALE_TTL": php_string(stale_ttl),
+        "MAX_BYTES": str(max_bytes),
+        "HTTP_TIMEOUT": str(http_timeout),
         "ALLOWED_TRANSPORT_MODE_TYPES": php_string_array(
             allowed_transport_mode_types or []
         ),
@@ -675,6 +792,48 @@ def clear_cache(cache_dir: Path) -> None:
             path.unlink()
 
 
+def update_cache_metadata(cache_dir: Path, **updates: Any) -> dict[str, Any]:
+    meta_path = cache_dir / "meta.json"
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    metadata.update(updates)
+    meta_path.write_text(
+        json.dumps(metadata, indent=4, separators=(",", ": ")),
+        encoding="utf-8",
+    )
+    return metadata
+
+
+def corrupt_file_without_changing_size(path: Path) -> None:
+    body = bytearray(path.read_bytes())
+    if not body:
+        raise RuntimeError(f"Cannot corrupt empty file: {path}")
+
+    index = next((i for i, byte in enumerate(body) if byte not in b"{}[],:\n\r "), 0)
+    body[index] = ord("X") if body[index] != ord("X") else ord("Y")
+    path.write_bytes(body)
+
+
+def assert_json_error_response(
+    status: int,
+    body: bytes,
+    expected_status: int,
+    detail_pattern: str,
+    message: str,
+) -> None:
+    assert_eq(status, expected_status, f"{message} status")
+    payload = json.loads(body.decode("utf-8"))
+    assert_eq(
+        payload.get("error"),
+        "could not fetch and filter valid GeoJSON",
+        f"{message} error",
+    )
+    details = str(payload.get("details", ""))
+    assert_true(
+        re.search(detail_pattern, details, re.IGNORECASE) is not None,
+        f"{message} details: {details!r}",
+    )
+
+
 def run_tests(args: argparse.Namespace) -> None:
     project_dir = Path(args.project_dir).resolve()
 
@@ -691,6 +850,7 @@ def run_tests(args: argparse.Namespace) -> None:
     php_port = get_free_port()
     mock_server = start_mock_server(mock_port)
     php_process: subprocess.Popen[str] | None = None
+    php_output = ""
 
     try:
         # Wait for mock server to be ready before proceeding
@@ -708,6 +868,7 @@ def run_tests(args: argparse.Namespace) -> None:
                 source_url=f"http://127.0.0.1:{mock_port}/source",
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
                 cache_dir=cache_dir,
+                cache_ttl="2s",
             )
             lint_php_project(php_bin, php_dir)
 
@@ -817,7 +978,13 @@ def run_tests(args: argparse.Namespace) -> None:
             )
             assert_point_close(initial_point_document, "point_inside", (1.0, 1.0))
             assert_point_close(initial_point_document, "line_crosses", (0.0, 2.0))
+            assert_point_close(initial_point_document, "line_touches_vertex", (-0.5, -0.5))
+            assert_point_close(initial_point_document, "line_collinear_boundary", (5.0, 0.0))
+            assert_point_close(initial_point_document, "zero_length_line_inside", (2.0, 2.0))
             assert_point_close(initial_point_document, "polygon_inside", (1.5, 1.5))
+            assert_point_close(initial_point_document, "polygon_touches_vertex", (-0.5, -0.5))
+            assert_point_close(initial_point_document, "polygon_open_ring_inside", (2.5, 2.5))
+            assert_point_close(initial_point_document, "degenerate_polygon_inside", (2.5, 2.0))
             assert_point_close(initial_point_document, "multipoint_hit", (18.0, 18.0))
             assert_point_close(initial_point_document, "multipolygon_hit", (35.75, 35.75))
             assert_point_close(initial_point_document, "geometrycollection_hit", (19.75, 21.0))
@@ -910,6 +1077,87 @@ def run_tests(args: argparse.Namespace) -> None:
                 "invalid geometry parameter error",
             )
             assert_eq(MockState.counts(), (1, 1), "invalid geometry parameter must not fetch upstream")
+
+            print("Test 5b: geometry aliases and additional conditional-request forms work")
+            status, headers, full_alias_body = http_request(
+                "GET", proxy_url + "?geometry=%20FULL%20"
+            )
+            assert_eq(status, 200, "trimmed uppercase full geometry status")
+            assert_eq(full_alias_body, initial_body, "full geometry alias body")
+
+            status, headers, centroid_body = http_request(
+                "GET", proxy_url + "?geometry=centroid"
+            )
+            assert_eq(status, 200, "centroid alias status")
+            assert_eq(headers.get("x-geometry-mode"), "point", "centroid alias mode")
+            assert_eq(centroid_body, initial_point_body, "centroid alias body")
+
+            status, _, array_geometry_body = http_request(
+                "GET", proxy_url + "?geometry[]=point"
+            )
+            assert_eq(status, 400, "array geometry parameter status")
+            array_geometry_error = json.loads(array_geometry_body.decode("utf-8"))
+            assert_contains(
+                "must be a string",
+                str(array_geometry_error.get("details", "")),
+                "array geometry parameter details",
+            )
+
+            status, _, wildcard_body = http_request(
+                "GET", proxy_url, headers={"If-None-Match": "*"}
+            )
+            assert_eq(status, 304, "If-None-Match wildcard status")
+            assert_eq(wildcard_body, b"", "If-None-Match wildcard body")
+
+            status, _, mismatched_etag_body = http_request(
+                "GET", proxy_url, headers={"If-None-Match": '"not-current"'}
+            )
+            assert_eq(status, 200, "mismatched If-None-Match status")
+            assert_eq(mismatched_etag_body, initial_body, "mismatched ETag response body")
+            assert_eq(MockState.counts(), (1, 1), "geometry and ETag variants should use fresh cache")
+
+            print("Test 5c: status endpoint and informational CLI commands report configured state")
+            status, status_headers, status_body = http_request(
+                "GET", proxy_url + "?status=1"
+            )
+            assert_eq(status, 200, "status endpoint status")
+            assert_true(
+                status_headers.get("content-type", "").startswith("application/json"),
+                "status endpoint content type",
+            )
+            status_document = json.loads(status_body.decode("utf-8"))
+            assert_true(status_document.get("status_available"), "status file should be available")
+            assert_true(status_document.get("cache", {}).get("data_exists"), "status cache data flag")
+            assert_eq(
+                status_document.get("cache", {}).get("metadata", {}).get("etag"),
+                etag_initial,
+                "status endpoint cache ETag",
+            )
+
+            help_result = subprocess.run(
+                [php_bin, str(configured_script), "--help"],
+                cwd=str(php_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            assert_eq(help_result.returncode, 0, "--help exit status")
+            assert_contains("--warm-cache", help_result.stdout, "--help output")
+
+            version_result = subprocess.run(
+                [php_bin, str(configured_script), "--version"],
+                cwd=str(php_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            assert_eq(version_result.returncode, 0, "--version exit status")
+            assert_eq(version_result.stdout.strip(), cache_meta["version"], "--version output")
+            assert_eq(MockState.counts(), (1, 1), "status and informational CLI commands must not fetch upstream")
 
             print("Test 6: a changed buffer is not used before TTL expiry, then produces a newly filtered cache entry")
             with MockState.lock:
@@ -1021,6 +1269,78 @@ def run_tests(args: argparse.Namespace) -> None:
                 "--warm-cache should fetch and filter both datasets even with a fresh cache",
             )
 
+            print("Test 9b: corrupt or incomplete cache entries are rejected and rebuilt")
+            before_corrupt_data_counts = MockState.counts()
+            corrupt_file_without_changing_size(cache_data_path)
+            status, headers, rebuilt_data_body = http_request("GET", proxy_url)
+            assert_eq(status, 200, "same-size corrupt cache data status")
+            assert_eq(headers.get("x-cache"), "MISS", "same-size corrupt cache should refresh")
+            assert_eq(rebuilt_data_body, moved_body, "same-size corrupt cache rebuilt body")
+            assert_eq(
+                MockState.counts(),
+                (before_corrupt_data_counts[0] + 1, before_corrupt_data_counts[1] + 1),
+                "same-size cache corruption should refetch both datasets",
+            )
+
+            before_corrupt_meta_counts = MockState.counts()
+            cache_meta_path.write_text("{invalid metadata", encoding="utf-8")
+            status, headers, rebuilt_meta_body = http_request("GET", proxy_url)
+            assert_eq(status, 200, "invalid cache metadata status")
+            assert_eq(headers.get("x-cache"), "MISS", "invalid metadata should refresh")
+            assert_eq(rebuilt_meta_body, moved_body, "invalid metadata rebuilt body")
+            assert_eq(
+                MockState.counts(),
+                (before_corrupt_meta_counts[0] + 1, before_corrupt_meta_counts[1] + 1),
+                "invalid metadata should refetch both datasets",
+            )
+
+            before_missing_point_counts = MockState.counts()
+            cache_point_path.unlink()
+            status, headers, rebuilt_point_body = http_request("GET", proxy_url)
+            assert_eq(status, 200, "missing point cache status")
+            assert_eq(headers.get("x-cache"), "MISS", "missing point cache should refresh")
+            assert_eq(rebuilt_point_body, moved_body, "missing point cache rebuilt full body")
+            assert_true(cache_point_path.is_file(), "missing point cache should be recreated")
+            assert_eq(
+                MockState.counts(),
+                (before_missing_point_counts[0] + 1, before_missing_point_counts[1] + 1),
+                "missing point cache should refetch both datasets",
+            )
+
+            print("Test 9c: refresh failure after stale_until returns 502 instead of stale data")
+            now = int(time.time())
+            update_cache_metadata(
+                cache_dir,
+                expires_at=now - 2,
+                stale_until=now - 1,
+            )
+            with MockState.lock:
+                MockState.source_fail = True
+
+            before_stale_expired_counts = MockState.counts()
+            status, _, stale_expired_body = http_request("GET", proxy_url)
+            assert_json_error_response(
+                status,
+                stale_expired_body,
+                502,
+                r"remote source returned HTTP 503",
+                "expired stale cache",
+            )
+            assert_eq(
+                MockState.counts(),
+                (before_stale_expired_counts[0] + 1, before_stale_expired_counts[1]),
+                "expired stale cache source failure should stop before buffer fetch",
+            )
+            assert_true(cache_data_path.is_file(), "expired stale cache data should not be deleted")
+
+            with MockState.lock:
+                MockState.source_fail = False
+
+            status, headers, recovered_after_stale_body = http_request("GET", proxy_url)
+            assert_eq(status, 200, "recovery after stale expiry status")
+            assert_eq(headers.get("x-cache"), "MISS", "recovery after stale expiry cache status")
+            assert_eq(recovered_after_stale_body, moved_body, "recovery after stale expiry body")
+
             print("Test 10: invalid buffer data returns 502 when no stale cache is available")
             clear_cache(cache_dir)
             with MockState.lock:
@@ -1057,6 +1377,128 @@ def run_tests(args: argparse.Namespace) -> None:
             assert_true(not cache_point_path.exists(), "failed refresh must not create point cache data")
             assert_true(not cache_meta_path.exists(), "failed refresh must not create cache metadata")
 
+            print("Test 10b: malformed source and buffer payloads return diagnostic 502 responses")
+            source_error_cases = [
+                ("invalid_json", r"does not contain valid JSON"),
+                ("json_scalar", r"does not contain a GeoJSON object"),
+                ("wrong_source_type", r"source GeoJSON must be a FeatureCollection"),
+                ("missing_features", r"source FeatureCollection has no valid features array"),
+                ("corrupt_gzip", r"could not decompress gzip payload"),
+            ]
+
+            with MockState.lock:
+                MockState.buffer_variant = "initial"
+
+            for source_mode, detail_pattern in source_error_cases:
+                clear_cache(cache_dir)
+                with MockState.lock:
+                    MockState.source_mode = source_mode
+                    MockState.buffer_mode = "gzip"
+                    MockState.source_fail = False
+                    MockState.buffer_fail = False
+
+                before_case_counts = MockState.counts()
+                status, _, error_body = http_request("GET", proxy_url)
+                assert_json_error_response(
+                    status,
+                    error_body,
+                    502,
+                    detail_pattern,
+                    f"source mode {source_mode}",
+                )
+                assert_eq(
+                    MockState.counts(),
+                    (before_case_counts[0] + 1, before_case_counts[1]),
+                    f"source mode {source_mode} should fail before buffer download",
+                )
+
+            for buffer_mode, detail_pattern in [
+                ("invalid_json", r"does not contain valid JSON"),
+                ("corrupt_gzip", r"could not decompress gzip payload"),
+            ]:
+                clear_cache(cache_dir)
+                with MockState.lock:
+                    MockState.source_mode = "gzip"
+                    MockState.buffer_mode = buffer_mode
+
+                before_case_counts = MockState.counts()
+                status, _, error_body = http_request("GET", proxy_url)
+                assert_json_error_response(
+                    status,
+                    error_body,
+                    502,
+                    detail_pattern,
+                    f"buffer mode {buffer_mode}",
+                )
+                assert_eq(
+                    MockState.counts(),
+                    (before_case_counts[0] + 1, before_case_counts[1] + 1),
+                    f"buffer mode {buffer_mode} should follow a successful source download",
+                )
+
+            print("Test 10c: upstream HTTP failures without cache return 502, while plain JSON succeeds")
+            clear_cache(cache_dir)
+            with MockState.lock:
+                MockState.source_mode = "gzip"
+                MockState.buffer_mode = "gzip"
+                MockState.source_fail = True
+
+            before_source_503_counts = MockState.counts()
+            status, _, source_503_body = http_request("GET", proxy_url)
+            assert_json_error_response(
+                status,
+                source_503_body,
+                502,
+                r"remote source returned HTTP 503",
+                "source HTTP 503 without cache",
+            )
+            assert_eq(
+                MockState.counts(),
+                (before_source_503_counts[0] + 1, before_source_503_counts[1]),
+                "source HTTP 503 should prevent buffer download",
+            )
+
+            clear_cache(cache_dir)
+            with MockState.lock:
+                MockState.source_fail = False
+                MockState.buffer_fail = True
+
+            before_buffer_503_counts = MockState.counts()
+            status, _, buffer_503_body = http_request("GET", proxy_url)
+            assert_json_error_response(
+                status,
+                buffer_503_body,
+                502,
+                r"remote source returned HTTP 503",
+                "buffer HTTP 503 without cache",
+            )
+            assert_eq(
+                MockState.counts(),
+                (before_buffer_503_counts[0] + 1, before_buffer_503_counts[1] + 1),
+                "buffer HTTP 503 should occur after source download",
+            )
+
+            clear_cache(cache_dir)
+            with MockState.lock:
+                MockState.buffer_fail = False
+                MockState.source_mode = "plain"
+                MockState.buffer_mode = "plain"
+
+            before_plain_counts = MockState.counts()
+            status, headers, plain_body = http_request("GET", proxy_url)
+            assert_eq(status, 200, "plain GeoJSON status")
+            assert_eq(headers.get("x-cache"), "MISS", "plain GeoJSON first request")
+            assert_eq(
+                retained_ids(json.loads(plain_body.decode("utf-8"))),
+                EXPECTED_INITIAL_IDS,
+                "plain GeoJSON filtered IDs",
+            )
+            assert_eq(
+                MockState.counts(),
+                (before_plain_counts[0] + 1, before_plain_counts[1] + 1),
+                "plain GeoJSON should fetch both datasets",
+            )
+
             print("Test 11: a first request in point mode builds both cache representations and applies the transport filter")
             php_output = stop_process(php_process)
             php_process = None
@@ -1071,9 +1513,10 @@ def run_tests(args: argparse.Namespace) -> None:
                 source_url=f"http://127.0.0.1:{mock_port}/source",
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
                 cache_dir=transport_cache_dir,
-                allowed_transport_mode_types=["bus", "train"],
+                allowed_transport_mode_types=[" train ", "bus", "bus"],
+                cache_ttl="30s",
             )
-            lint_php_script(php_bin, transport_php_script)
+            lint_php_project(php_bin, transport_php_dir)
             transport_php_port = get_free_port()
             php_process = start_php_server(
                 php_bin=php_bin,
@@ -1119,21 +1562,28 @@ def run_tests(args: argparse.Namespace) -> None:
             print("Test 12: changing the allow-list invalidates an otherwise fresh cache")
             first_transport_counts = MockState.counts()
             old_transport_etag = headers.get("etag")
+            old_transport_meta = json.loads(
+                (transport_cache_dir / "meta.json").read_text(encoding="utf-8")
+            )
+            assert_true(
+                int(old_transport_meta["expires_at"]) > int(time.time()),
+                "allow-list cache must still be fresh before cache-key test",
+            )
             php_output += stop_process(php_process)
             php_process = None
 
             transport_php_dir2 = tmp_dir / "php-transport2"
             transport_php_dir2.mkdir()
-            transport_cache_dir2 = tmp_dir / "cache-transport2"
             transport_php_script2 = create_configured_php_copy(
                 project_dir=project_dir,
                 target_dir=transport_php_dir2,
                 source_url=f"http://127.0.0.1:{mock_port}/source",
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
-                cache_dir=transport_cache_dir2,
+                cache_dir=transport_cache_dir,
                 allowed_transport_mode_types=["tram"],
+                cache_ttl="30s",
             )
-            lint_php_script(php_bin, transport_php_script2)
+            lint_php_project(php_bin, transport_php_dir2)
             php_process = start_php_server(
                 php_bin=php_bin,
                 php_dir=transport_php_dir2,
@@ -1163,13 +1613,196 @@ def run_tests(args: argparse.Namespace) -> None:
                 "changed attribute-filter result should receive a new ETag",
             )
 
+            print("Test 13: redirects are followed and compressed/download size limits are enforced")
+            php_output += stop_process(php_process)
+            php_process = None
+            MockState.reset()
+
+            redirect_php_dir = tmp_dir / "php-redirect"
+            redirect_cache_dir = tmp_dir / "cache-redirect"
+            create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=redirect_php_dir,
+                source_url=f"http://127.0.0.1:{mock_port}/source-redirect",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer-redirect",
+                cache_dir=redirect_cache_dir,
+                cache_ttl="30s",
+            )
+            redirect_php_port = get_free_port()
+            php_process = start_php_server(
+                php_bin=php_bin,
+                php_dir=redirect_php_dir,
+                php_port=redirect_php_port,
+            )
+            redirect_proxy_url = (
+                f"http://127.0.0.1:{redirect_php_port}/public/index.php"
+            )
+
+            status, headers, redirect_body = http_request("GET", redirect_proxy_url)
+            assert_eq(status, 200, "redirected upstream status")
+            assert_eq(headers.get("x-cache"), "MISS", "redirected upstream cache status")
+            assert_eq(
+                retained_ids(json.loads(redirect_body.decode("utf-8"))),
+                EXPECTED_INITIAL_IDS,
+                "redirected upstream filtered IDs",
+            )
+            assert_eq(MockState.counts(), (1, 1), "both redirected resources should be fetched")
+
+            php_output += stop_process(php_process)
+            php_process = None
+            MockState.reset()
+
+            limit_php_dir = tmp_dir / "php-limits"
+            limit_cache_dir = tmp_dir / "cache-limits"
+            create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=limit_php_dir,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=limit_cache_dir,
+                cache_ttl="30s",
+                max_bytes=1024,
+            )
+            limit_php_port = get_free_port()
+            php_process = start_php_server(
+                php_bin=php_bin,
+                php_dir=limit_php_dir,
+                php_port=limit_php_port,
+            )
+            limit_proxy_url = f"http://127.0.0.1:{limit_php_port}/public/index.php"
+
+            with MockState.lock:
+                MockState.source_mode = "oversized_body"
+
+            status, _, oversized_body = http_request("GET", limit_proxy_url)
+            assert_json_error_response(
+                status,
+                oversized_body,
+                502,
+                r"remote response exceeds MAX_BYTES",
+                "oversized download",
+            )
+            assert_eq(MockState.counts(), (1, 0), "oversized source should prevent buffer fetch")
+
+            clear_cache(limit_cache_dir)
+            with MockState.lock:
+                MockState.source_mode = "gzip_bomb"
+
+            status, _, gzip_bomb_body = http_request("GET", limit_proxy_url)
+            assert_json_error_response(
+                status,
+                gzip_bomb_body,
+                502,
+                r"(?:remote|decompressed) response exceeds MAX_BYTES",
+                "oversized decompressed download",
+            )
+            assert_eq(MockState.counts(), (2, 0), "oversized decompressed source should prevent buffer fetch")
+
+            print("Test 14: concurrent cold-cache requests share one locked refresh")
+            php_output += stop_process(php_process)
+            php_process = None
+            MockState.reset()
+            with MockState.lock:
+                MockState.source_delay_seconds = 0.25
+                MockState.buffer_delay_seconds = 0.25
+
+            concurrent_php_dir = tmp_dir / "php-concurrent"
+            concurrent_cache_dir = tmp_dir / "cache-concurrent"
+            create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=concurrent_php_dir,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=concurrent_cache_dir,
+                cache_ttl="30s",
+            )
+            concurrent_ports = [get_free_port(), get_free_port()]
+            concurrent_processes: list[subprocess.Popen[str]] = []
+
+            try:
+                for concurrent_port in concurrent_ports:
+                    concurrent_processes.append(
+                        start_php_server(
+                            php_bin=php_bin,
+                            php_dir=concurrent_php_dir,
+                            php_port=concurrent_port,
+                        )
+                    )
+
+                concurrent_urls = [
+                    f"http://127.0.0.1:{port}/public/index.php"
+                    for port in concurrent_ports
+                ]
+                with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                    futures = [
+                        executor.submit(http_request, "GET", url)
+                        for url in concurrent_urls
+                    ]
+                    concurrent_results = [future.result(timeout=20) for future in futures]
+
+                assert_eq(
+                    sorted(result[0] for result in concurrent_results),
+                    [200, 200],
+                    "concurrent request statuses",
+                )
+                assert_eq(
+                    sorted(result[1].get("x-cache") for result in concurrent_results),
+                    ["HIT", "MISS"],
+                    "concurrent cache statuses",
+                )
+                assert_eq(
+                    concurrent_results[0][2],
+                    concurrent_results[1][2],
+                    "concurrent response bodies",
+                )
+                assert_eq(MockState.counts(), (1, 1), "locked refresh upstream request counts")
+                assert_true(
+                    (concurrent_cache_dir / "data.geojson").is_file()
+                    and (concurrent_cache_dir / "points.geojson").is_file()
+                    and (concurrent_cache_dir / "meta.json").is_file(),
+                    "concurrent refresh should activate all cache files",
+                )
+                assert_eq(
+                    list(concurrent_cache_dir.glob("*.tmp")),
+                    [],
+                    "concurrent refresh temporary files",
+                )
+            finally:
+                for concurrent_process in concurrent_processes:
+                    php_output += stop_process(concurrent_process)
+
+            print("Test 15: invalid configuration fails before serving requests")
+            invalid_config_php_dir = tmp_dir / "php-invalid-config"
+            invalid_config_script = create_configured_php_copy(
+                project_dir=project_dir,
+                target_dir=invalid_config_php_dir,
+                source_url=f"http://127.0.0.1:{mock_port}/source",
+                buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
+                cache_dir=tmp_dir / "cache-invalid-config",
+                cache_ttl="not-a-duration",
+            )
+            invalid_config_result = subprocess.run(
+                [php_bin, str(invalid_config_script), "--version"],
+                cwd=str(invalid_config_php_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            assert_eq(invalid_config_result.returncode, 1, "invalid config exit status")
+            assert_contains(
+                "invalid duration",
+                invalid_config_result.stdout,
+                "invalid config diagnostic",
+            )
+
             print()
             print("All tests passed.")
 
     finally:
-        php_output = ""
         if php_process is not None:
-            php_output = stop_process(php_process)
+            php_output += stop_process(php_process)
 
         mock_server.shutdown()
         mock_server.server_close()
