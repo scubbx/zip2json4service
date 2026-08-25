@@ -9,6 +9,7 @@ use GeoJsonProxy\GeoJson\BoundingBox;
 use GeoJsonProxy\GeoJson\GeometryExtractor;
 use GeoJsonProxy\GeoJson\Point;
 use GeoJsonProxy\GeoJson\Segment;
+use GeoJsonProxy\Diagnostics\Logger;
 
 /**
  * Spatial filtering utilities
@@ -19,13 +20,13 @@ final class SpatialFilter
      * Filter features by buffer polygons
      *
      * @param array &$source Source GeoJSON document
-     * @param array $polygonCoordinates List of polygon coordinates
+     * @param array &$polygonCoordinates List of polygon coordinates
      * @param array $attributeStatistics Statistics from attribute filtering
      * @return array Statistics about spatial filtering
      */
     public static function filterByBufferPolygons(
         array &$source,
-        array $polygonCoordinates,
+        array &$polygonCoordinates,
         array $attributeStatistics
     ): array {
         if (($source['type'] ?? null) !== 'FeatureCollection') {
@@ -43,67 +44,108 @@ final class SpatialFilter
             throw new RuntimeException('buffer GeoJSON contains no Polygon or MultiPolygon geometry');
         }
 
-        // Build buffer polygons with their bounding boxes for optimization
-        $bufferPolygons = [];
-        foreach ($polygonCoordinates as $polygon) {
-            $bbox = BoundingBox::fromCoordinates($polygon);
-            if ($bbox !== null) {
-                $bufferPolygons[] = [
-                    'coordinates' => $polygon,
-                    'bbox' => $bbox,
-                ];
-            }
+        $featureBboxes = [];
+        foreach ($features as $featureIndex => $feature) {
+            $geometry = is_array($feature) ? ($feature['geometry'] ?? null) : null;
+            $featureBboxes[$featureIndex] = is_array($geometry)
+                ? GeometryExtractor::geometryBoundingBox($geometry)
+                : null;
         }
 
-        if ($bufferPolygons === []) {
+        $matched = str_repeat("\0", intdiv($candidateCount + 7, 8));
+        $matchedCount = 0;
+        $inputPolygonCount = count($polygonCoordinates);
+        $processedInputCount = 0;
+        $bufferPolygonCount = 0;
+        $bufferSegmentCount = 0;
+        $boundaryGridCellCount = 0;
+        $maxCompactIndexBytes = 0;
+
+        Logger::setStage('preparing-buffer-polygons', [
+            'input_buffer_polygons' => $inputPolygonCount,
+            'candidate_features' => $candidateCount,
+        ]);
+
+        foreach ($polygonCoordinates as $polygonIndex => $polygon) {
+            $processedInputCount++;
+            Logger::setStage('preparing-buffer-polygon', [
+                'buffer_polygon' => $processedInputCount,
+                'input_buffer_polygons' => $inputPolygonCount,
+                'candidate_features' => $candidateCount,
+            ]);
+
+            $prepared = is_array($polygon)
+                ? PreparedPolygon::prepare($polygon, (int) $polygonIndex)
+                : null;
+
+            // The prepared polygon contains only compact numeric/index data.
+            unset($polygonCoordinates[$polygonIndex], $polygon);
+
+            if ($prepared === null) {
+                continue;
+            }
+
+            $bufferPolygonCount++;
+            $bufferSegmentCount += $prepared['segment_count'];
+            $boundaryGridCellCount += count($prepared['boundary_index']['cells']);
+            $maxCompactIndexBytes = max(
+                $maxCompactIndexBytes,
+                $prepared['compact_index_bytes']
+            );
+
+            foreach ($features as $featureIndex => $feature) {
+                if (self::bitSetContains($matched, (int) $featureIndex)) {
+                    continue;
+                }
+
+                $featureBbox = $featureBboxes[$featureIndex] ?? null;
+                if (
+                    !is_array($featureBbox)
+                    || !BoundingBox::intersect($featureBbox, $prepared['bbox'])
+                ) {
+                    continue;
+                }
+
+                $geometry = is_array($feature) ? ($feature['geometry'] ?? null) : null;
+                if (
+                    is_array($geometry)
+                    && PreparedPolygon::geometryIntersects($geometry, $prepared)
+                ) {
+                    self::bitSetAdd($matched, (int) $featureIndex);
+                    $matchedCount++;
+                }
+            }
+
+            $progress = [
+                'processed_buffer_polygons' => $bufferPolygonCount,
+                'input_buffer_polygons' => $inputPolygonCount,
+                'candidate_features' => $candidateCount,
+                'retained_features_so_far' => $matchedCount,
+                'buffer_segments_so_far' => $bufferSegmentCount,
+                'current_polygon_segments' => $prepared['segment_count'],
+                'current_boundary_grid_cells' => count($prepared['boundary_index']['cells']),
+                'current_point_index_reference_bytes' =>
+                    $prepared['point_index_reference_bytes'],
+                'current_grid_index_reference_bytes' =>
+                    $prepared['grid_index_reference_bytes'],
+                'current_compact_index_bytes' => $prepared['compact_index_bytes'],
+                'percent' => $inputPolygonCount > 0
+                    ? round($processedInputCount * 100 / $inputPolygonCount, 1)
+                    : 100.0,
+            ];
+
+            Logger::log('INFO', 'buffer polygon processed with compact spatial indexes', $progress);
+            Logger::setStage('filtering-spatially', $progress);
+            unset($prepared);
+        }
+
+        if ($bufferPolygonCount === 0) {
             throw new RuntimeException('buffer GeoJSON contains no valid Polygon or MultiPolygon geometry');
         }
 
-        $matched = [];
-        $matchedCount = 0;
-
-        foreach ($features as $featureIndex => $feature) {
-            if (!is_array($feature)) {
-                continue;
-            }
-
-            $geometry = $feature['geometry'] ?? null;
-            if (!is_array($geometry)) {
-                continue;
-            }
-
-            $featureBbox = GeometryExtractor::geometryBoundingBox($geometry);
-            if ($featureBbox === null) {
-                continue;
-            }
-
-            // First check: bounding box intersection for quick rejection
-            $bboxMatched = false;
-            foreach ($bufferPolygons as $bufferPoly) {
-                if (BoundingBox::intersect($featureBbox, $bufferPoly['bbox'])) {
-                    $bboxMatched = true;
-                    break;
-                }
-            }
-
-            if (!$bboxMatched) {
-                continue;
-            }
-
-            // Full geometric check against each buffer polygon
-            foreach ($bufferPolygons as $bufferPoly) {
-                if (self::geometryIntersectsPolygon($geometry, $bufferPoly['coordinates'])) {
-                    $matched[$featureIndex] = true;
-                    $matchedCount++;
-                    break;
-                }
-            }
-        }
-
-        // Compact the features array
         $writeIndex = 0;
         for ($readIndex = 0; $readIndex < $candidateCount; $readIndex++) {
-            if (!isset($matched[$readIndex])) {
+            if (!self::bitSetContains($matched, $readIndex)) {
                 unset($features[$readIndex]);
                 continue;
             }
@@ -116,16 +158,39 @@ final class SpatialFilter
             $writeIndex++;
         }
 
-        unset($features[$writeIndex]);
+        unset($featureBboxes, $matched);
 
-        // Remove source-level bbox as it may no longer be valid
         unset($source['bbox']);
 
         return array_merge($attributeStatistics, [
             'retained_features' => $writeIndex,
             'spatially_rejected_features' => $candidateCount - $writeIndex,
-            'buffer_polygons' => count($bufferPolygons),
+            'buffer_polygons' => $bufferPolygonCount,
+            'buffer_segments' => $bufferSegmentCount,
+            'boundary_grid_cells' => $boundaryGridCellCount,
+            'max_compact_index_bytes' => $maxCompactIndexBytes,
         ]);
+    }
+
+    private static function bitSetContains(string $bits, int $id): bool
+    {
+        if ($id < 0) {
+            return false;
+        }
+
+        $byteIndex = intdiv($id, 8);
+        if ($byteIndex >= strlen($bits)) {
+            return false;
+        }
+
+        return (ord($bits[$byteIndex]) & (1 << ($id & 7))) !== 0;
+    }
+
+    private static function bitSetAdd(string &$bits, int $id): void
+    {
+        $byteIndex = intdiv($id, 8);
+        $mask = 1 << ($id & 7);
+        $bits[$byteIndex] = chr(ord($bits[$byteIndex]) | $mask);
     }
 
     /**
