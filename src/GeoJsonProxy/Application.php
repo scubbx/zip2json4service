@@ -26,7 +26,7 @@ final class Application
     private Config $config;
     private CacheManager $cacheManager;
     private Fetcher $fetcher;
-    private ?array $requestTimeWindow = null;
+    private ?array $requestTimeFilter = null;
 
     public function __construct(Config $config)
     {
@@ -60,16 +60,17 @@ final class Application
         }
 
         $geometryMode = $this->getRequestedGeometryMode();
-        $this->requestTimeWindow = $this->getRequestedTimeWindow();
+        $this->requestTimeFilter = $this->getRequestedTimeFilter();
 
         Logger::initialize($this->config->toArray(), 'web');
         Logger::setStage('request-start', [
             'method' => $method,
             'request_uri' => $_SERVER['REQUEST_URI'] ?? null,
             'geometry_mode' => $geometryMode,
-            'time_filter' => $this->requestTimeWindow === null ? null : [
-                'from' => $this->requestTimeWindow['from_value'],
-                'until' => $this->requestTimeWindow['until_value'],
+            'time_filter' => $this->requestTimeFilter === null ? null : [
+                'from' => $this->requestTimeFilter['from_value'],
+                'until' => $this->requestTimeFilter['until_value'],
+                'minimum_duration_days' => $this->requestTimeFilter['minimum_duration_days_value'],
             ],
         ]);
 
@@ -553,31 +554,39 @@ final class Application
     }
 
     /**
-     * Get and validate the optional request time window.
+     * Get and validate the optional request time criteria.
      *
      * @return array{
      *   from: int|null,
      *   until: int|null,
+     *   minimum_duration: int|null,
      *   from_value: string|null,
-     *   until_value: string|null
+     *   until_value: string|null,
+     *   minimum_duration_days_value: string|null
      * }|null
      */
-    private function getRequestedTimeWindow(): ?array
+    private function getRequestedTimeFilter(): ?array
     {
         $fromParameter = $this->config->getString('time_filter_from_parameter');
         $untilParameter = $this->config->getString('time_filter_until_parameter');
+        $minimumDurationParameter = $this->config->getString(
+            'time_filter_min_duration_days_parameter'
+        );
         $fromIsSet = array_key_exists($fromParameter, $_GET);
         $untilIsSet = array_key_exists($untilParameter, $_GET);
+        $minimumDurationIsSet = array_key_exists($minimumDurationParameter, $_GET);
 
-        if (!$fromIsSet && !$untilIsSet) {
+        if (!$fromIsSet && !$untilIsSet && !$minimumDurationIsSet) {
             return null;
         }
 
-        $window = [
+        $filter = [
             'from' => null,
             'until' => null,
+            'minimum_duration' => null,
             'from_value' => null,
             'until_value' => null,
+            'minimum_duration_days_value' => null,
         ];
 
         foreach ([
@@ -609,11 +618,38 @@ final class Application
                 exit;
             }
 
-            $window[$criterion] = $timestamp;
-            $window[$criterion . '_value'] = $value;
+            $filter[$criterion] = $timestamp;
+            $filter[$criterion . '_value'] = $value;
         }
 
-        if ($window['from'] !== null && $window['until'] !== null && $window['from'] > $window['until']) {
+        if ($minimumDurationIsSet) {
+            $value = $_GET[$minimumDurationParameter];
+            if (!is_string($value)) {
+                $this->sendError(
+                    400,
+                    'invalid time filter parameter',
+                    $minimumDurationParameter . ' must be a string'
+                );
+                exit;
+            }
+
+            $value = trim($value);
+            $duration = TimeWindowFilter::parseDurationDays($value);
+            if ($duration === null) {
+                $this->sendError(
+                    400,
+                    'invalid time filter parameter',
+                    $minimumDurationParameter
+                    . ' must be a non-negative number of days with at most six decimal places'
+                );
+                exit;
+            }
+
+            $filter['minimum_duration'] = $duration;
+            $filter['minimum_duration_days_value'] = $value;
+        }
+
+        if ($filter['from'] !== null && $filter['until'] !== null && $filter['from'] > $filter['until']) {
             $this->sendError(
                 400,
                 'invalid time filter window',
@@ -622,7 +658,7 @@ final class Application
             exit;
         }
 
-        return $window;
+        return $filter;
     }
 
     /**
@@ -637,7 +673,7 @@ final class Application
         $body = null;
         $timeFilterStatistics = null;
 
-        if ($this->requestTimeWindow !== null) {
+        if ($this->requestTimeFilter !== null) {
             $body = file_get_contents($path);
             if ($body === false || strlen($body) !== $bytes) {
                 $this->sendError(500, 'could not read cached GeoJSON');
@@ -652,8 +688,9 @@ final class Application
                     $document,
                     $this->config->getString('time_filter_start_property'),
                     $this->config->getString('time_filter_end_property'),
-                    $this->requestTimeWindow['from'],
-                    $this->requestTimeWindow['until']
+                    $this->requestTimeFilter['from'],
+                    $this->requestTimeFilter['until'],
+                    $this->requestTimeFilter['minimum_duration']
                 );
                 $body = $this->encodeFeatureCollectionForApi($document);
                 unset($document);
@@ -674,7 +711,7 @@ final class Application
         $ifNoneMatch = $_SERVER['HTTP_IF_NONE_MATCH'] ?? '';
         $notModified = $this->etagHeaderMatches($ifNoneMatch, $etag);
 
-        if ($this->requestTimeWindow === null && !$notModified && $method !== 'HEAD') {
+        if ($this->requestTimeFilter === null && !$notModified && $method !== 'HEAD') {
             $body = file_get_contents($path);
             if ($body === false || strlen($body) !== $bytes) {
                 $this->sendError(500, 'could not read cached GeoJSON');
@@ -688,9 +725,10 @@ final class Application
             'geometry_mode' => $geometryMode,
             'response_bytes' => $bytes,
             'etag' => $etag,
-            'time_filter' => $this->requestTimeWindow === null ? null : [
-                'from' => $this->requestTimeWindow['from_value'],
-                'until' => $this->requestTimeWindow['until_value'],
+            'time_filter' => $this->requestTimeFilter === null ? null : [
+                'from' => $this->requestTimeFilter['from_value'],
+                'until' => $this->requestTimeFilter['until_value'],
+                'minimum_duration_days' => $this->requestTimeFilter['minimum_duration_days_value'],
                 'statistics' => $timeFilterStatistics,
             ],
         ]);
@@ -879,6 +917,8 @@ Configuration:
                  URL parameter for the inclusive lower request boundary.
   TIME_FILTER_UNTIL_PARAMETER
                  URL parameter for the inclusive upper request boundary.
+  TIME_FILTER_MIN_DURATION_DAYS_PARAMETER
+                 URL parameter for the minimum event duration in days.
   CACHE_DIR      Writable cache directory.
   CACHE_TTL      Fresh result-cache lifetime.
   STALE_TTL      Stale-cache lifetime after refresh errors.
@@ -899,6 +939,9 @@ Web usage:
 
   Features whose intervals overlap an optional request time window:
   https://your-domain.example/public/index.php?from=2025-01-01T00%3A00%3A00Z&until=2025-01-31T23%3A59%3A59Z
+
+  Features lasting at least seven days:
+  https://your-domain.example/public/index.php?minDurationDays=7
 
 Status endpoint:
 
@@ -942,6 +985,8 @@ Notes:
   The from boundary compares against TIME_FILTER_END_PROPERTY; the until
   boundary compares against TIME_FILTER_START_PROPERTY. Boundaries are
   inclusive and timestamps use ISO 8601.
+  The optional minimum-duration parameter compares end minus start against a
+  non-negative number of days. The duration boundary is also inclusive.
   Buffer data may be a Geometry, Feature, FeatureCollection, or
   GeometryCollection containing Polygon or MultiPolygon geometries.
   Buffer polygons are processed one at a time.

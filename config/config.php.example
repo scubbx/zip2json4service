@@ -25,6 +25,7 @@ const TIME_FILTER_START_PROPERTY = 'start-time';
 const TIME_FILTER_END_PROPERTY = 'stop-time';
 const TIME_FILTER_FROM_PARAMETER = 'from';
 const TIME_FILTER_UNTIL_PARAMETER = 'until';
+const TIME_FILTER_MIN_DURATION_DAYS_PARAMETER = 'minDurationDays';
 
 // Cache Configuration
 const CACHE_DIR = __DIR__ . '/../cache';

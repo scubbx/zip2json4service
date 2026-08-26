@@ -24,8 +24,9 @@ Covered behavior:
   cache is available;
 * the optional affected-transportmode-types allow-list uses OR semantics,
   rejects missing/non-matching values, and participates in cache invalidation;
-* request-time from/until criteria use configurable properties and parameter
-  names, inclusive interval-overlap semantics, and do not alter the warm cache;
+* request-time from/until and minimum-duration criteria use configurable
+  properties and parameter names, inclusive semantics, and do not alter the
+  warm cache;
 * malformed upstream payloads, plain JSON, size limits, stale expiry, cache
   corruption, status/CLI behavior, and concurrent refresh locking are covered.
 """
@@ -300,6 +301,12 @@ TIME_PROPERTY_VALUES: dict[str, tuple[str | None, str | None]] = {
     "point_third_buffer": (DEFAULT_FEATURE_START, "not-a-timestamp"),
     "line_crosses": (None, DEFAULT_FEATURE_END),
     "line_touches_vertex": (DEFAULT_FEATURE_START, None),
+    # Exact and above-minimum durations for minDurationDays boundary tests.
+    "polygon_inside": ("2025-01-12T00:00:00Z", "2025-01-19T00:00:00Z"),
+    "polygon_contains_buffer": (
+        "2025-01-11T00:00:00Z",
+        "2025-01-19T00:00:00Z",
+    ),
 }
 
 for _feature in SOURCE_GEOJSON["features"]:
@@ -449,6 +456,24 @@ EXPECTED_TIME_UNTIL_IDS = [
     feature_id
     for feature_id in EXPECTED_INITIAL_IDS
     if feature_id not in {"point_second_buffer", "line_crosses"}
+]
+
+EXPECTED_MINIMUM_DURATION_IDS = [
+    "point_inside",
+    "point_outer_boundary",
+    "polygon_inside",
+    "polygon_contains_buffer",
+]
+
+EXPECTED_MINIMUM_DURATION_WITH_WINDOW_IDS = [
+    "point_inside",
+    "polygon_inside",
+    "polygon_contains_buffer",
+]
+
+EXPECTED_FRACTIONAL_MINIMUM_DURATION_IDS = [
+    "point_inside",
+    "point_outer_boundary",
 ]
 
 EXPECTED_MOVED_IDS = [
@@ -741,6 +766,7 @@ def create_configured_php_copy(
     time_filter_end_property: str = "stop-time",
     time_filter_from_parameter: str = "from",
     time_filter_until_parameter: str = "until",
+    time_filter_min_duration_days_parameter: str = "minDurationDays",
     cache_ttl: str = "1s",
     stale_ttl: str = "20s",
     max_bytes: int = 10 * 1024 * 1024,
@@ -772,6 +798,9 @@ def create_configured_php_copy(
         "TIME_FILTER_END_PROPERTY": php_string(time_filter_end_property),
         "TIME_FILTER_FROM_PARAMETER": php_string(time_filter_from_parameter),
         "TIME_FILTER_UNTIL_PARAMETER": php_string(time_filter_until_parameter),
+        "TIME_FILTER_MIN_DURATION_DAYS_PARAMETER": php_string(
+            time_filter_min_duration_days_parameter
+        ),
     }
 
     for name, value in replacements.items():
@@ -1243,6 +1272,79 @@ def run_tests(args: argparse.Namespace) -> None:
                 "offset timestamp should represent the same instant",
             )
 
+            print("Test 3b.1: minimum event duration works alone and with a time window")
+            status, duration_headers, duration_body = http_request(
+                "GET", proxy_url + "?" + urlencode({"minDurationDays": "7"})
+            )
+            assert_eq(status, 200, "minimum-duration status")
+            assert_eq(duration_headers.get("x-cache"), "HIT", "minimum-duration cache status")
+            duration_document = json.loads(duration_body.decode("utf-8"))
+            assert_eq(
+                retained_ids(duration_document),
+                EXPECTED_MINIMUM_DURATION_IDS,
+                "events lasting at least seven days",
+            )
+            assert_true(
+                "polygon_inside" in retained_ids(duration_document),
+                "an event lasting exactly the minimum duration must be retained",
+            )
+            assert_true(
+                all(
+                    feature_id not in retained_ids(duration_document)
+                    for feature_id in (
+                        "point_third_buffer",
+                        "line_crosses",
+                        "line_touches_vertex",
+                    )
+                ),
+                "minimum duration requires valid start and end properties",
+            )
+
+            status, _, point_duration_body = http_request(
+                "GET",
+                point_url + "&" + urlencode({"minDurationDays": "7"}),
+            )
+            assert_eq(status, 200, "point minimum-duration status")
+            assert_eq(
+                retained_ids(json.loads(point_duration_body.decode("utf-8"))),
+                EXPECTED_MINIMUM_DURATION_IDS,
+                "point minimum-duration IDs",
+            )
+
+            status, _, combined_duration_body = http_request(
+                "GET",
+                proxy_url
+                + "?"
+                + urlencode(
+                    {
+                        "from": TIME_FILTER_FROM,
+                        "until": TIME_FILTER_UNTIL,
+                        "minDurationDays": "7",
+                    }
+                ),
+            )
+            assert_eq(status, 200, "combined time-window and duration status")
+            assert_eq(
+                retained_ids(json.loads(combined_duration_body.decode("utf-8"))),
+                EXPECTED_MINIMUM_DURATION_WITH_WINDOW_IDS,
+                "combined time-window and minimum-duration IDs",
+            )
+
+            status, _, fractional_duration_body = http_request(
+                "GET", proxy_url + "?" + urlencode({"minDurationDays": "8.5"})
+            )
+            assert_eq(status, 200, "fractional minimum-duration status")
+            assert_eq(
+                retained_ids(json.loads(fractional_duration_body.decode("utf-8"))),
+                EXPECTED_FRACTIONAL_MINIMUM_DURATION_IDS,
+                "fractional minimum-duration IDs",
+            )
+            assert_eq(
+                MockState.counts(),
+                (1, 1),
+                "minimum-duration variants must not fetch upstream data",
+            )
+
             status, _, empty_time_body = http_request(
                 "GET",
                 proxy_url
@@ -1278,6 +1380,12 @@ def run_tests(args: argparse.Namespace) -> None:
                 proxy_url + "?until=",
                 proxy_url + "?from[]=2025-01-10",
                 proxy_url + "?from=2025-02-30",
+                proxy_url + "?minDurationDays=",
+                proxy_url + "?minDurationDays=-1",
+                proxy_url + "?minDurationDays=seven",
+                proxy_url + "?minDurationDays[]=7",
+                proxy_url + "?minDurationDays=1.1234567",
+                proxy_url + "?minDurationDays=999999999999999999999999",
                 proxy_url
                 + "?"
                 + urlencode(
@@ -1897,6 +2005,7 @@ def run_tests(args: argparse.Namespace) -> None:
                 time_filter_end_property="customEndTime",
                 time_filter_from_parameter="von",
                 time_filter_until_parameter="bis",
+                time_filter_min_duration_days_parameter="mindestTage",
                 cache_ttl="30s",
             )
             custom_time_php_port = get_free_port()
@@ -1913,7 +2022,13 @@ def run_tests(args: argparse.Namespace) -> None:
                 "GET",
                 custom_time_proxy_url
                 + "?"
-                + urlencode({"von": TIME_FILTER_FROM, "bis": TIME_FILTER_UNTIL}),
+                + urlencode(
+                    {
+                        "von": TIME_FILTER_FROM,
+                        "bis": TIME_FILTER_UNTIL,
+                        "mindestTage": "7",
+                    }
+                ),
             )
             assert_eq(status, 200, "custom time-filter configuration status")
             assert_eq(
@@ -1923,13 +2038,15 @@ def run_tests(args: argparse.Namespace) -> None:
             )
             assert_eq(
                 retained_ids(json.loads(custom_time_body.decode("utf-8"))),
-                EXPECTED_TIME_WINDOW_IDS,
+                EXPECTED_MINIMUM_DURATION_WITH_WINDOW_IDS,
                 "custom time properties and parameters output",
             )
             assert_eq(MockState.counts(), (1, 1), "custom time filter upstream counts")
 
             status, custom_unfiltered_headers, custom_unfiltered_body = http_request(
-                "GET", custom_time_proxy_url + "?from=not-the-configured-parameter"
+                "GET",
+                custom_time_proxy_url
+                + "?from=not-the-configured-parameter&minDurationDays=also-not-configured",
             )
             assert_eq(status, 200, "unconfigured time parameter status")
             assert_eq(custom_unfiltered_headers.get("x-cache"), "HIT", "custom config cache reuse")
@@ -2132,7 +2249,8 @@ def run_tests(args: argparse.Namespace) -> None:
                 buffer_url=f"http://127.0.0.1:{mock_port}/buffer",
                 cache_dir=tmp_dir / "cache-invalid-time-config",
                 time_filter_from_parameter="time",
-                time_filter_until_parameter="time",
+                time_filter_until_parameter="until",
+                time_filter_min_duration_days_parameter="time",
                 cache_ttl="30s",
             )
             invalid_time_config_result = subprocess.run(

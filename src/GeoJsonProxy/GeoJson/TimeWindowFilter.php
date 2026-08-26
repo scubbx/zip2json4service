@@ -10,10 +10,12 @@ use Exception;
 use RuntimeException;
 
 /**
- * Filters FeatureCollections by overlap with a requested time window.
+ * Filters FeatureCollections by request-specific time criteria.
  */
 final class TimeWindowFilter
 {
+    private const MICROSECONDS_PER_DAY = 86_400_000_000;
+
     /**
      * Parse an ISO-8601-like timestamp into Unix microseconds.
      *
@@ -46,7 +48,46 @@ final class TimeWindowFilter
     }
 
     /**
-     * Retain features whose own interval overlaps the requested interval.
+     * Parse a non-negative number of days into microseconds.
+     *
+     * Up to six decimal places are accepted and converted without floating
+     * point rounding.
+     */
+    public static function parseDurationDays(string $value): ?int
+    {
+        $value = trim($value);
+        if (!preg_match('/^(\d+)(?:\.(\d{1,6}))?$/D', $value, $matches)) {
+            return null;
+        }
+
+        $wholeDigits = ltrim($matches[1], '0');
+        $wholeDigits = $wholeDigits === '' ? '0' : $wholeDigits;
+        $maximumWholeDays = intdiv(PHP_INT_MAX, self::MICROSECONDS_PER_DAY);
+        $maximumWholeDaysString = (string) $maximumWholeDays;
+
+        if (strlen($wholeDigits) > strlen($maximumWholeDaysString)
+            || (strlen($wholeDigits) === strlen($maximumWholeDaysString)
+                && strcmp($wholeDigits, $maximumWholeDaysString) > 0)
+        ) {
+            return null;
+        }
+
+        $wholeMicroseconds = ((int) $wholeDigits) * self::MICROSECONDS_PER_DAY;
+        $fractionDigits = $matches[2] ?? '';
+        $fractionMillionths = $fractionDigits === ''
+            ? 0
+            : (int) str_pad($fractionDigits, 6, '0');
+        $fractionMicroseconds = $fractionMillionths * 86_400;
+
+        if ($wholeMicroseconds > PHP_INT_MAX - $fractionMicroseconds) {
+            return null;
+        }
+
+        return $wholeMicroseconds + $fractionMicroseconds;
+    }
+
+    /**
+     * Retain features whose interval matches all requested time criteria.
      *
      * @return array{
      *   source_features: int,
@@ -60,7 +101,8 @@ final class TimeWindowFilter
         string $startProperty,
         string $endProperty,
         ?int $from,
-        ?int $until
+        ?int $until,
+        ?int $minimumDuration
     ): array {
         if (($document['type'] ?? null) !== 'FeatureCollection') {
             throw new RuntimeException('time filtering requires a FeatureCollection');
@@ -70,7 +112,7 @@ final class TimeWindowFilter
             throw new RuntimeException('time filtering requires a features array');
         }
 
-        if ($from === null && $until === null) {
+        if ($from === null && $until === null && $minimumDuration === null) {
             throw new RuntimeException('time filtering requires at least one criterion');
         }
 
@@ -78,43 +120,35 @@ final class TimeWindowFilter
         $total = count($features);
         $writeIndex = 0;
         $invalid = 0;
+        $needsStart = $until !== null || $minimumDuration !== null;
+        $needsEnd = $from !== null || $minimumDuration !== null;
 
         for ($readIndex = 0; $readIndex < $total; $readIndex++) {
             $feature = $features[$readIndex] ?? null;
             $properties = is_array($feature) && is_array($feature['properties'] ?? null)
                 ? $feature['properties']
                 : null;
-            $matches = $properties !== null;
+            $featureStart = $properties !== null && $needsStart
+                && is_string($properties[$startProperty] ?? null)
+                ? self::parseTimestamp($properties[$startProperty])
+                : null;
+            $featureEnd = $properties !== null && $needsEnd
+                && is_string($properties[$endProperty] ?? null)
+                ? self::parseTimestamp($properties[$endProperty])
+                : null;
+            $hasRequiredTimes = $properties !== null
+                && (!$needsStart || $featureStart !== null)
+                && (!$needsEnd || $featureEnd !== null);
 
-            if (!$matches) {
+            if (!$hasRequiredTimes) {
                 $invalid++;
             }
 
-            if ($matches && $from !== null) {
-                $featureEnd = is_string($properties[$endProperty] ?? null)
-                    ? self::parseTimestamp($properties[$endProperty])
-                    : null;
-
-                if ($featureEnd === null) {
-                    $invalid++;
-                    $matches = false;
-                } elseif ($featureEnd < $from) {
-                    $matches = false;
-                }
-            }
-
-            if ($matches && $until !== null) {
-                $featureStart = is_string($properties[$startProperty] ?? null)
-                    ? self::parseTimestamp($properties[$startProperty])
-                    : null;
-
-                if ($featureStart === null) {
-                    $invalid++;
-                    $matches = false;
-                } elseif ($featureStart > $until) {
-                    $matches = false;
-                }
-            }
+            $matches = $hasRequiredTimes
+                && ($from === null || $featureEnd >= $from)
+                && ($until === null || $featureStart <= $until)
+                && ($minimumDuration === null
+                    || $featureEnd - $featureStart >= $minimumDuration);
 
             if (!$matches) {
                 unset($features[$readIndex]);

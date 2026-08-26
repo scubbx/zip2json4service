@@ -73,7 +73,8 @@ The integration test (`test_php_proxy.py`) covers:
 - Spatial filtering accuracy, including holes, boundaries, open rings, and degenerate edge cases
 - Full and point representations plus transport-mode attribute filtering
 - Configurable time properties/parameters, one-sided and two-sided intervals,
-  inclusive boundaries, validation errors, and response-specific ETags
+  minimum event durations, inclusive boundaries, validation errors, and
+  response-specific ETags
 - Cache HIT, MISS, STALE, cache-key invalidation, integrity checks, and stale expiry
 - ETag/304, HEAD, OPTIONS, CORS, status endpoint, and CLI behavior
 - Concurrent cold-cache requests and refresh-lock coordination
@@ -99,7 +100,7 @@ All user-configurable settings are in `config/config.php` as constants:
 - Transport mode filtering settings
 - Time-filter property names and URL parameter names. The shipped defaults use
   the EVIS GeoJSON properties `start-time`/`stop-time` and request parameters
-  `from`/`until`.
+  `from`/`until`/`minDurationDays`.
 - Cache directories and TTLs
 - Size limits and timeouts
 - Debug and logging settings
@@ -127,8 +128,8 @@ The core filtering logic in `SpatialFilter::filterByBufferPolygons()`:
 - **Cache Invalidation**: Based on configuration changes that affect upstream
   preparation (version, URLs, transport-mode filter settings)
 - **Request Time Filtering**: Applied after loading the full or point cache.
-  Never write a request-specific time-window result back to the shared cache;
-  `--warm-cache` must remain independent of URL parameters.
+  Never write a request-specific time-window or minimum-duration result back
+  to the shared cache; `--warm-cache` must remain independent of URL parameters.
 - **Atomic Writes**: Temporary files + rename for atomic cache updates
 - **Locking**: File-based locking (`refresh.lock`) prevents race conditions
 

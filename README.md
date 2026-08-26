@@ -30,7 +30,7 @@ Der Proxy funktioniert in folgenden Schritten:
 3. **Räumliche Filterung**: Behält nur Features, die mindestens ein Puffer-Polygon schneiden, berühren oder innerhalb liegen
 4. **Punktdarstellung**: Berechnet parallel eine Punktdarstellung (Schwerpunkte) für Symbol-Layer
 5. **Caching**: Speichert die gefilterten Ergebnisse zwischenspeichert für schnelle Auslieferung
-6. **Zeitfilter**: Filtert auf Wunsch pro URL-Anfrage nach einem überlappenden Gültigkeitszeitraum
+6. **Zeitfilter**: Filtert auf Wunsch pro URL-Anfrage nach einem überlappenden Gültigkeitszeitraum und einer Mindestdauer
 7. **Auslieferung**: Liefert die Ergebnisse als GeoJSON mit CORS-Unterstützung aus
 
 **Wichtig**: Beide GeoJSON-Datensätze müssen dasselbe Koordinatensystem verwenden (typischerweise WGS84 mit [Längengrad, Breitengrad]).
@@ -186,6 +186,7 @@ const TIME_FILTER_END_PROPERTY = 'stop-time';
 // Namen der URL-Parameter
 const TIME_FILTER_FROM_PARAMETER = 'from';
 const TIME_FILTER_UNTIL_PARAMETER = 'until';
+const TIME_FILTER_MIN_DURATION_DAYS_PARAMETER = 'minDurationDays';
 
 // === Cache-Einstellungen ===
 
@@ -324,6 +325,7 @@ Oder laden Sie `cache/proxy.log` per FTP herunter.
 | `TIME_FILTER_END_PROPERTY` | string | 'stop-time' | Property mit dem Ende des Feature-Zeitraums |
 | `TIME_FILTER_FROM_PARAMETER` | string | 'from' | URL-Parameter für die inklusive Untergrenze |
 | `TIME_FILTER_UNTIL_PARAMETER` | string | 'until' | URL-Parameter für die inklusive Obergrenze |
+| `TIME_FILTER_MIN_DURATION_DAYS_PARAMETER` | string | 'minDurationDays' | URL-Parameter für die inklusive Mindestdauer in Tagen |
 | `CACHE_DIR` | string | `config/../cache` | Cache-Verzeichnis |
 | `CACHE_TTL` | string | '15m' | Frische Cache-Lebensdauer |
 | `STALE_TTL` | string | '24h' | Veralteter Cache-Lebensdauer |
@@ -372,6 +374,7 @@ const TIME_FILTER_START_PROPERTY = 'start-time';
 const TIME_FILTER_END_PROPERTY = 'stop-time';
 const TIME_FILTER_FROM_PARAMETER = 'from';
 const TIME_FILTER_UNTIL_PARAMETER = 'until';
+const TIME_FILTER_MIN_DURATION_DAYS_PARAMETER = 'minDurationDays';
 
 const CACHE_DIR = __DIR__ . '/../cache';
 const CACHE_TTL = '30m';    // 30 Minuten frischer Cache
@@ -395,15 +398,18 @@ const STATUS_ENDPOINT_ENABLED = true;
 | Standard | Vollständige gefilterte Geometrien | `https://ihre-domain.de/geojson-proxy/public/index.php` |
 | Punktdarstellung | Schwerpunkte für Symbol-Layer | `https://ihre-domain.de/geojson-proxy/public/index.php?geometry=point` |
 | Zeitfenster | Features mit überlappendem Gültigkeitszeitraum | `https://ihre-domain.de/geojson-proxy/public/index.php?from=2025-01-01&until=2025-01-31` |
+| Mindestdauer | Features mit einer Mindestdauer in Tagen | `https://ihre-domain.de/geojson-proxy/public/index.php?minDurationDays=7` |
 | Status | Diagnose-Informationen | `https://ihre-domain.de/geojson-proxy/public/index.php?status=1` |
 
 #### Zeitfilter
 
-Mit den Standardwerten akzeptiert der Daten-Endpunkt die optionalen Parameter `from` und `until`. Beide erwarten ein ISO-8601-Datum oder einen ISO-8601-Zeitstempel, beispielsweise:
+Mit den Standardwerten akzeptiert der Daten-Endpunkt die optionalen Parameter `from`, `until` und `minDurationDays`. `from` und `until` erwarten ein ISO-8601-Datum oder einen ISO-8601-Zeitstempel, beispielsweise:
 
 ```text
 https://ihre-domain.de/geojson-proxy/public/index.php?from=2025-01-01T00%3A00%3A00Z&until=2025-01-31T23%3A59%3A59Z
 https://ihre-domain.de/geojson-proxy/public/index.php?geometry=point&from=2025-01-01
+https://ihre-domain.de/geojson-proxy/public/index.php?minDurationDays=7
+https://ihre-domain.de/geojson-proxy/public/index.php?from=2025-01-01&until=2025-01-31&minDurationDays=7.5
 ```
 
 Die Prüfung erfolgt als Intervall-Überlappung mit inklusiven Grenzen:
@@ -412,10 +418,12 @@ Die Prüfung erfolgt als Intervall-Überlappung mit inklusiven Grenzen:
 - `until`: Der Beginn des Features (`start-time`) muss gleich oder früher sein.
 - Sind beide Parameter gesetzt, muss der Feature-Zeitraum das angefragte Zeitfenster überlappen.
 - Ist nur einer gesetzt, wird nur die entsprechende Grenze geprüft.
+- `minDurationDays`: Die Differenz `stop-time - start-time` muss mindestens so viele Tage betragen. Die Grenze ist inklusiv; bei `7` bleibt ein exakt sieben Tage dauerndes Ereignis erhalten.
+- Die Mindestdauer kann allein oder gemeinsam mit `from` und `until` verwendet werden. Nichtnegative Dezimalwerte mit Punkt und bis zu sechs Nachkommastellen sind zulässig.
 - Fehlt ein dabei benötigtes Property oder enthält es keinen gültigen Zeitwert, wird das Feature verworfen.
-- Fehlen beide URL-Parameter, findet keine Zeitfilterung statt.
+- Fehlen alle drei URL-Parameter, findet keine Zeitfilterung statt.
 
-Leere oder ungültige Zeitangaben sowie `from > until` liefern `HTTP 400`. Datumswerte ohne Uhrzeit sowie Zeitstempel ohne Zeitzonenangabe werden als UTC interpretiert. Der Zeitfilter arbeitet auf dem bereits vorbereiteten Cache: Verschiedene Zeitfenster lösen keinen Upstream-Abruf aus und verändern weder den durch `--warm-cache` erzeugten Cache noch seine Dateien. Die Antwort erhält jedoch einen zum gefilterten Inhalt passenden ETag.
+Leere oder ungültige Zeitangaben, negative Mindestdauern sowie `from > until` liefern `HTTP 400`. Datumswerte ohne Uhrzeit sowie Zeitstempel ohne Zeitzonenangabe werden als UTC interpretiert. Ein Tag entspricht dabei exakt 86.400 Sekunden. Der Zeitfilter arbeitet auf dem bereits vorbereiteten Cache: Verschiedene Zeitfenster oder Mindestdauern lösen keinen Upstream-Abruf aus und verändern weder den durch `--warm-cache` erzeugten Cache noch seine Dateien. Die Antwort erhält jedoch einen zum gefilterten Inhalt passenden ETag.
 
 **HTTP-Methoden**:
 - `GET` - Daten abrufen
@@ -481,7 +489,7 @@ Der Test prüft unter anderem:
 - die Syntax aller PHP-Dateien in der temporär konfigurierten Projektkopie;
 - gzip-komprimierte und unkomprimierte Upstream-Daten, Redirects, Größenlimits und fehlerhafte Payloads;
 - alle unterstützten GeoJSON-Geometrietypen sowie Löcher, Grenzberührungen und degenerierte Randfälle;
-- vollständige und punktförmige Repräsentationen einschließlich Transportmodus- und Zeitfilter;
+- vollständige und punktförmige Repräsentationen einschließlich Transportmodus-, Zeitfenster- und Mindestdauerfilter;
 - Cache `MISS`, `HIT` und `STALE`, Cache-Key-Invalidierung, beschädigte Cache-Dateien und den Ablauf von `stale_until`;
 - ETags, `304 Not Modified`, `HEAD`, `OPTIONS`, CORS, Status-Endpunkt und CLI-Befehle;
 - konkurrierende Cold-Cache-Anfragen und die Verriegelung des gemeinsamen Refreshs.
